@@ -22,6 +22,10 @@ private struct WindowChromeConfigurator: NSViewRepresentable {
     private func configure(_ window: NSWindow?) {
         guard let window else { return }
 
+        // Veronica currently has an intentionally light-only visual theme.
+        // Match the native AppKit window chrome to the SwiftUI content.
+        window.appearance = NSAppearance(named: .aqua)
+        window.backgroundColor = .white
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.toolbarStyle = .unified
@@ -170,82 +174,43 @@ struct ContentView: View {
     }
 
     private var mainInterface: some View {
-        ZStack {
-            VeronicaTheme.canvas
-                .ignoresSafeArea()
-
-            switch selectedSection {
-            case .dashboard:
-                DashboardView()
-
-            case .activity:
-                ActivityView()
-
-            case .review:
-                ReviewView()
-
-            case .history:
-                HistoryView()
-
-            case .settings:
-                SettingsView()
+        VStack(spacing: 0) {
+            HStack {
+                Spacer()
+                toolbarNavigation
+                Spacer()
             }
+            .padding(.vertical, 7)
+            .padding(.horizontal, 72)
+            .background(VeronicaTheme.canvas)
+
+            Divider()
+                .opacity(0.45)
+
+            ZStack {
+                VeronicaTheme.canvas
+                    .ignoresSafeArea()
+
+                switch selectedSection {
+                case .dashboard:
+                    DashboardView()
+
+                case .activity:
+                    ActivityView()
+
+                case .review:
+                    ReviewView()
+
+                case .history:
+                    HistoryView()
+
+                case .settings:
+                    SettingsView()
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .toolbar {
-            ToolbarItemGroup(placement: .principal) {
-                HStack(spacing: 8) {
-                    ForEach(AppSection.allCases) { section in
-                        Button {
-                            selectedSection = section
-                        } label: {
-                            HStack(spacing: 7) {
-                                Image(systemName: section.systemImage)
-
-                                Text(section.rawValue)
-                                    .lineLimit(1)
-
-                                if section == .review,
-                                   let count = model.snapshot?.unresolvedReviews.count,
-                                   count > 0 {
-                                    Text(count.formatted())
-                                        .font(.caption.bold())
-                                        .padding(.horizontal, 7)
-                                        .padding(.vertical, 2)
-                                        .background(
-                                            selectedSection == section
-                                                ? VeronicaTheme.accent.opacity(0.15)
-                                                : VeronicaTheme.strongerFill,
-                                            in: Capsule()
-                                        )
-                                }
-                            }
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(
-                                selectedSection == section
-                                    ? VeronicaTheme.accent
-                                    : VeronicaTheme.ink
-                            )
-                            .padding(.horizontal, 13)
-                            .padding(.vertical, 5)
-                            .frame(minHeight: 32)
-                            .contentShape(Rectangle())
-                            .background {
-                                if selectedSection == section {
-                                    Capsule()
-                                        .fill(VeronicaTheme.accent.opacity(0.11))
-                                }
-                            }
-                            .fixedSize(horizontal: true, vertical: false)
-                        }
-                        .buttonStyle(.plain)
-                        .contentShape(Rectangle())
-                        .help(section.rawValue)
-                    }
-                }
-                .fixedSize()
-            }
-        }
     }
 
     private var toolbarNavigation: some View {

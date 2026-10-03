@@ -24,9 +24,14 @@ struct SettingsView: View {
         Self.dateFormatter.string(from: value)
     }
 
+    private var shouldStartAtBottomForUICapture: Bool {
+        ProcessInfo.processInfo.arguments.contains("--ui-settings-bottom")
+    }
+
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Settings").font(.largeTitle.bold())
                     Text("Folders, Veronica data, runtime readiness, and diagnostics.").foregroundStyle(.secondary)
@@ -89,6 +94,54 @@ struct SettingsView: View {
                     }
                     .padding(.vertical, 4)
                 }
+                GroupBox("Media to process") {
+                    if let media = model.snapshot?.mediaProcessing {
+                        VStack(alignment: .leading, spacing: 14) {
+                            Toggle(
+                                "Images",
+                                isOn: Binding(
+                                    get: { media.images },
+                                    set: { value in
+                                        Task {
+                                            await model.updateMediaProcessing(images: value)
+                                        }
+                                    }
+                                )
+                            )
+
+                            Toggle(
+                                "Videos",
+                                isOn: Binding(
+                                    get: { media.videos },
+                                    set: { value in
+                                        Task {
+                                            await model.updateMediaProcessing(videos: value)
+                                        }
+                                    }
+                                )
+                            )
+
+                            Toggle(
+                                "Audio",
+                                isOn: Binding(
+                                    get: { media.audio },
+                                    set: { value in
+                                        Task {
+                                            await model.updateMediaProcessing(audio: value)
+                                        }
+                                    }
+                                )
+                            )
+
+                            Text("Disabled media types are still inventoried for safety and history, but Veronica will not plan conversions for them.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 4)
+                        .disabled(model.isRunningAnnual || model.isLoading)
+                    }
+                }
+
                 GroupBox("Date scope") {
                     if let scope = model.snapshot?.dateScope {
                         VStack(alignment: .leading, spacing: 14) {
@@ -372,11 +425,28 @@ struct SettingsView: View {
                     Text("Veronica uses verified staging, per-file quarantine, rollback, and durable audit history.")
                         .font(.caption).foregroundStyle(.secondary).padding(.top, 4)
                 }
+                .id("settings-bottom")
             }
             .frame(maxWidth: 900, alignment: .leading)
             .padding(.horizontal, 32)
             .padding(.vertical, 26)
             .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .task {
+                guard shouldStartAtBottomForUICapture else { return }
+
+                // Wait for the initial engine snapshot to finish populating
+                // Settings before jumping to the bottom capture anchor.
+                while model.isLoading || model.snapshot == nil {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+
+                try? await Task.sleep(nanoseconds: 300_000_000)
+
+                withAnimation(nil) {
+                    proxy.scrollTo("settings-bottom", anchor: .bottom)
+                }
+            }
         }
         .background(VeronicaTheme.canvas)
         .groupBoxStyle(VeronicaGroupBoxStyle(fill: VeronicaTheme.canvas))

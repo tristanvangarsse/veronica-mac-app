@@ -38,8 +38,10 @@ An existing database cannot be repointed to a different archive. This prevents h
 
 ## Release packaging
 
-A public app should not require Homebrew or a user-installed Python runtime. The repository therefore supports a standalone engine executable produced on macOS with PyInstaller. EngineRunner automatically prefers that executable.
+A public release bundles Veronica's Python engine as a standalone executable produced on macOS with PyInstaller, so users do not need to install Python or Pillow separately. EngineRunner automatically prefers that bundled executable.
 
-FFmpeg/ffprobe and HandBrakeCLI must likewise be bundled using redistributable macOS builds with their license obligations satisfied. The repository's staging script is intentionally conservative: it can copy local binaries for testing but refuses to call them portable when `otool` exposes external non-system dependencies.
+Media tools use a deliberate two-tier lookup model. EngineRunner prefers executables bundled under `Contents/Resources/Tools/bin`, then checks conventional Homebrew/local locations (`/opt/homebrew/bin` and `/usr/local/bin`) before the inherited `PATH`. The current supported distribution model therefore allows `ffmpeg`/`ffprobe` and `HandBrakeCLI` to be installed externally, including through Homebrew. The native Settings UI reports missing dependencies and maintenance remains disabled until all required tools are available.
+
+A future fully self-contained release may bundle redistributable macOS builds of FFmpeg/ffprobe and HandBrakeCLI. Such binaries must be genuinely relocatable and their license obligations must be satisfied. The repository's staging script remains intentionally conservative: it can copy local binaries for testing but refuses to call them portable when `otool` exposes external non-system dependencies. Homebrew binaries with absolute `/opt/homebrew/...` dynamic-library dependencies must not be treated as self-contained merely because the executable itself was copied into the app bundle.
 
 Apple Developer ID signing and notarization must occur on macOS with the release maintainer's credentials.

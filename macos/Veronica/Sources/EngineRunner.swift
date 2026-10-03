@@ -185,6 +185,25 @@ final class EngineRunner {
         }
     }
 
+    func configureMediaProcessing(
+        images: Bool,
+        videos: Bool,
+        audio: Bool
+    ) async throws {
+        let result = try await run([
+            "configure-media-types",
+            "--images", images ? "true" : "false",
+            "--videos", videos ? "true" : "false",
+            "--audio", audio ? "true" : "false"
+        ])
+
+        guard result.exitCode == 0 else {
+            throw EngineRunnerError.invalidOutput(
+                result.stderr.isEmpty ? result.stdout : result.stderr
+            )
+        }
+    }
+
     func configureDateScope(
         mode: String,
         start: String?,

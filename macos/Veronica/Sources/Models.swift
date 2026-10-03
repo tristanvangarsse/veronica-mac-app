@@ -1,5 +1,11 @@
 import Foundation
 
+struct MediaProcessingPolicy: Codable {
+    let images: Bool
+    let videos: Bool
+    let audio: Bool
+}
+
 struct UISnapshot: Codable {
     let version: String
     let configured: Bool
@@ -21,6 +27,7 @@ struct UISnapshot: Codable {
     let recentChanges: [RecentChange]
     let filenamePolicy: FilenamePolicySettings
     let dateScope: DateScopeSettings
+    let mediaProcessing: MediaProcessingPolicy
     let preflight: PreflightStatus
 
     enum CodingKeys: String, CodingKey {
@@ -41,6 +48,7 @@ struct UISnapshot: Codable {
         case recentChanges = "recent_changes"
         case filenamePolicy = "filename_policy"
         case dateScope = "date_scope"
+        case mediaProcessing = "media_processing"
     }
 }
 

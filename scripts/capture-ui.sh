@@ -60,6 +60,50 @@ wait_for_process() {
     return 1
 }
 
+wait_for_ui_ready() {
+    local section="$1"
+    local start_size="${2:-0}"
+    local log_file="$HOME/Library/Application Support/Veronica/logs/veronica.log"
+    local current_size=0
+    local new_log=""
+    local i
+
+    echo "Waiting for Veronica to finish loading $section..."
+
+    for i in {1..80}; do
+        if ! pgrep -x Veronica >/dev/null 2>&1; then
+            echo "ERROR: Veronica exited while loading section: $section"
+            return 1
+        fi
+
+        if [[ -f "$log_file" ]]; then
+            current_size="$(stat -f%z "$log_file" 2>/dev/null || echo 0)"
+
+            if [[ "$current_size" -gt "$start_size" ]]; then
+                new_log="$(tail -c +$((start_size + 1)) "$log_file" 2>/dev/null || true)"
+
+                if [[ "$new_log" == *"[Engine] Command ui-snapshot exited 0"* ]]; then
+                    local count
+                    count="$(window_count | tr -d '[:space:]')"
+
+                    if [[ ! "$count" =~ '^[0-9]+$' ]] || [[ "$count" -lt 1 ]]; then
+                        echo "ERROR: Veronica has no window after loading section: $section"
+                        return 1
+                    fi
+
+                    echo "Veronica finished loading $section with $count window(s)."
+                    sleep 0.5
+                    return 0
+                fi
+            fi
+        fi
+
+        sleep 0.25
+    done
+
+    echo "ERROR: Timed out waiting for Veronica to finish loading section: $section"
+    return 1
+}
 window_count() {
     osascript <<'APPLESCRIPT' 2>/dev/null || echo 0
 tell application "System Events"
@@ -155,10 +199,23 @@ capture_current_window() {
     echo "Saved: $OUT_DIR/$filename.png"
 }
 
+log_size() {
+    local log_file="$HOME/Library/Application Support/Veronica/logs/veronica.log"
+
+    if [[ -f "$log_file" ]]; then
+        stat -f%z "$log_file" 2>/dev/null || echo 0
+    else
+        echo 0
+    fi
+}
+
 launch_section() {
     local section="$1"
 
     quit_veronica
+
+    local ui_log_start
+    ui_log_start="$(log_size)"
 
     open -na "$APP_PATH" --args --ui-section "$section"
 
@@ -173,7 +230,12 @@ launch_section() {
     fi
 
     focus_and_position
-    sleep 1
+
+    if ! wait_for_ui_ready "$section" "$ui_log_start"; then
+        exit 1
+    fi
+
+    sleep 0.5
 }
 
 capture_section() {
@@ -187,26 +249,6 @@ capture_section() {
     capture_current_window "$filename"
 }
 
-scroll_settings_to_bottom() {
-    echo "=== Scrolling Settings to bottom ==="
-
-    osascript <<'APPLESCRIPT'
-tell application "System Events"
-    tell process "Veronica"
-        set frontmost to true
-
-        -- Put the pointer/focus into the detail area first.
-        click at {850, 500}
-        delay 0.3
-
-        -- End key is the most reliable way to drive a SwiftUI ScrollView down.
-        key code 119
-        delay 1
-    end tell
-end tell
-APPLESCRIPT
-}
-
 capture_section dashboard dashboard
 capture_section activity activity
 capture_section review review
@@ -217,7 +259,30 @@ echo "=== Capturing Settings top ==="
 launch_section settings
 capture_current_window settings
 
-scroll_settings_to_bottom
+echo
+echo "=== Capturing Settings bottom ==="
+quit_veronica
+
+SETTINGS_BOTTOM_LOG_START="$(log_size)"
+
+open -na "$APP_PATH" --args --ui-section settings --ui-settings-bottom
+
+if ! wait_for_process; then
+    echo "ERROR: Veronica process never started for Settings bottom."
+    exit 1
+fi
+
+if ! wait_for_window; then
+    echo "ERROR: Veronica started but never exposed a window for Settings bottom."
+    exit 1
+fi
+
+focus_and_position
+
+if ! wait_for_ui_ready settings "$SETTINGS_BOTTOM_LOG_START"; then
+    exit 1
+fi
+
 capture_current_window settings-bottom
 
 echo
@@ -234,6 +299,12 @@ UNIQUE_COUNT="$(
 
 echo
 echo "Unique screenshots: $UNIQUE_COUNT / 6"
+
+if [[ "$UNIQUE_COUNT" -ne 6 ]]; then
+    echo "ERROR: expected 6 visually distinct screenshots, got $UNIQUE_COUNT."
+    echo "One or more UI sections may not have rendered or scrolled correctly."
+    exit 1
+fi
 
 echo
 echo "=== Creating zip ==="

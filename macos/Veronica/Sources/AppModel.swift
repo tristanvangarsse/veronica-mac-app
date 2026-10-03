@@ -32,6 +32,34 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func updateMediaProcessing(
+        images: Bool? = nil,
+        videos: Bool? = nil,
+        audio: Bool? = nil
+    ) async {
+        guard let current = snapshot?.mediaProcessing else { return }
+
+        let nextImages = images ?? current.images
+        let nextVideos = videos ?? current.videos
+        let nextAudio = audio ?? current.audio
+
+        do {
+            try await EngineRunner.shared.configureMediaProcessing(
+                images: nextImages,
+                videos: nextVideos,
+                audio: nextAudio
+            )
+            await refresh()
+        } catch {
+            errorMessage = error.localizedDescription
+            DiagnosticsCenter.shared.log(
+                "ERROR",
+                "App",
+                "Could not update media processing settings: \(error.localizedDescription)"
+            )
+        }
+    }
+
     func updateFilenamePolicy(
         enabled: Bool? = nil,
         dateFormat: String? = nil,

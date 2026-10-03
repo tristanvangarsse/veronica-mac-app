@@ -32,3 +32,8 @@ staging/
 .venv/
 
 ui-screenshots/
+
+# Veronica standalone engine build outputs
+veronica-engine.spec
+macos/Veronica/Resources/VeronicaEngine/veronica-engine
+macos/Veronica/Resources/VeronicaEngine/preset-720P.json

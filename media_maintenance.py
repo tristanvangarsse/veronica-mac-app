@@ -255,6 +255,32 @@ def apply_product_date_scope_settings(
     return result
 
 
+
+def media_processing_product_settings(state_dir: Path) -> dict[str, bool]:
+    """Return which media types Veronica is allowed to process."""
+    saved = load_product_settings(state_dir)
+
+    return {
+        "images": bool(saved.get("process_images", True)),
+        "videos": bool(saved.get("process_videos", True)),
+        "audio": bool(saved.get("process_audio", True)),
+    }
+
+
+def apply_product_media_processing_settings(
+    cfg: dict[str, Any],
+    state_dir: Path,
+) -> dict[str, Any]:
+    """Overlay persisted media-type preferences onto engine config."""
+    result = json.loads(json.dumps(cfg))
+    values = media_processing_product_settings(state_dir)
+
+    result["process_images"] = values["images"]
+    result["process_videos"] = values["videos"]
+    result["process_audio"] = values["audio"]
+
+    return result
+
 def database_archive_root(state_dir: Path) -> Optional[Path]:
     db = state_dir / "media-maintenance.sqlite"
     if not db.exists():
@@ -981,6 +1007,11 @@ def apply_filename_policy(
     cfg: dict[str, Any],
 ) -> dict[str, Any]:
     """Attach canonical destination naming or turn an eligible skip into RENAME."""
+    # A disabled media type must remain completely untouched.
+    # Filename standardization must not turn it into an executable rename.
+    if item.get("operation") == "SKIP_MEDIA_TYPE_DISABLED":
+        return item
+
     if not cfg.get("filename_standardization_enabled", True):
         return item
 
@@ -1066,10 +1097,31 @@ def make_item(row: dict[str, Any], asset_id: int, cfg: dict[str, Any]) -> dict[s
         "executable": False,
     }
 
-    # Audit safety decisions always win.
+    # Explicit preserve decisions remain the strongest safety boundary.
     if row.get("action") == "PRESERVE":
         base.update(operation="PRESERVE", reason=row.get("reason") or "audit_preserve")
         return base
+
+    # User-visible media-type preferences are a hard processing boundary.
+    # Disabled types remain inventoried and auditable, but Veronica plans no
+    # conversion, filename modification, or processing-related review for them.
+    media_enabled = {
+        "image": bool(cfg.get("process_images", True)),
+        "video": bool(cfg.get("process_videos", True)),
+        "audio": bool(cfg.get("process_audio", True)),
+    }
+
+    if kind in media_enabled and not media_enabled[kind]:
+        base.update(
+            operation="SKIP_MEDIA_TYPE_DISABLED",
+            policy_version=None,
+            reason=f"{kind}_processing_disabled_by_user",
+            target={"media_type": kind},
+            executable=False,
+        )
+        return base
+
+    # Audit review decisions apply only to media types the user has enabled.
     if row.get("action") == "REVIEW":
         base.update(operation="REVIEW", reason=row.get("reason") or "audit_review")
         return base
@@ -2698,6 +2750,450 @@ def commit_one(args: argparse.Namespace, quiet: bool = False) -> dict[str, Any]:
 
 
 
+def choose_audio_commit_candidate(report: dict[str, Any], relpath: str) -> dict[str, Any]:
+    candidates = [
+        r for r in report.get("results", [])
+        if r.get("status") == "STAGED_VERIFIED"
+        and r.get("operation") == "CONVERT_AUDIO"
+        and r.get("verification", {}).get("metadata_ready_for_commit") is True
+        and r.get("relpath") == relpath
+    ]
+    if not candidates:
+        raise SystemExit(
+            "Requested relpath is not a verified staged audio file in this staging run"
+        )
+    return candidates[0]
+
+
+def commit_one_audio(args: argparse.Namespace, quiet: bool = False) -> dict[str, Any]:
+    if not args.yes:
+        raise SystemExit(
+            "Audio commit requires --yes. This command changes exactly one audio file "
+            "and quarantines the original."
+        )
+
+    state_dir = Path(args.state_dir).expanduser().resolve()
+    db_path = state_dir / "media-maintenance.sqlite"
+    if not db_path.exists():
+        raise SystemExit(f"State database not found: {db_path}")
+
+    report = load_staging_report(state_dir, args.staging_id)
+    plan_id = report.get("plan_id")
+    plan_candidates = sorted(
+        state_dir.glob(f"plan-*-{str(plan_id)[:12]}.json")
+    )
+    if not plan_candidates:
+        raise SystemExit(f"Frozen plan JSON not found for plan {plan_id}")
+
+    plan = load_plan(plan_candidates[-1])
+    root = Path(plan["root"]).resolve()
+    cfg = load_config(Path(args.config).expanduser() if args.config else None)
+
+    if root.stat().st_dev != state_dir.stat().st_dev:
+        raise SystemExit(
+            "Audio commit requires Media and the state directory on the same "
+            "filesystem for atomic quarantine/rollback"
+        )
+
+    staged = choose_audio_commit_candidate(report, args.relpath)
+    relpath = staged["relpath"]
+    item = find_plan_item(plan, relpath)
+
+    if (
+        not item
+        or item.get("operation") != "CONVERT_AUDIO"
+        or not item.get("executable")
+    ):
+        raise SystemExit("Plan item is no longer an executable audio conversion")
+
+    # Lock commit to the exact frozen/current audio policy, just as video
+    # commit is locked to its frozen/current video policy.
+    plan_policy = (
+        (plan.get("policy_snapshot", {}).get("policies", {}) or {})
+        .get("streams_audio")
+    )
+    if not plan_policy:
+        raise SystemExit("Refusing audio commit: frozen plan has no audio policy")
+
+    policies = {
+        "required": plan_policy,
+        "plan": plan_policy,
+        "item": item.get("policy_version"),
+        "staged": staged.get("policy_version"),
+        "config": (cfg.get("policies", {}) or {}).get("streams_audio"),
+    }
+    if len(set(policies.values())) != 1:
+        raise SystemExit(
+            "Refusing audio commit: policy mismatch: "
+            + ", ".join(f"{k}={v}" for k, v in policies.items())
+        )
+
+    source = root / relpath
+    staged_path = Path(staged.get("output_path", "")).resolve()
+
+    if not staged_path.is_file():
+        raise SystemExit(f"Staged output missing: {staged_path}")
+
+    expected_stage_root = (
+        state_dir / "staging" / args.staging_id
+    ).resolve()
+    if expected_stage_root not in staged_path.parents:
+        raise SystemExit("Staged output is outside the expected staging directory")
+
+    ok, why = verify_source_against_item(root, item)
+    if not ok:
+        raise SystemExit(
+            f"Refusing audio commit: frozen plan is stale for {relpath}: {why}"
+        )
+
+    status, verification = verify_staged_output(
+        source, staged_path, item, cfg
+    )
+    if (
+        status != "STAGED_VERIFIED"
+        or verification.get("metadata_ready_for_commit") is not True
+    ):
+        raise SystemExit(
+            f"Refusing audio commit: staged output no longer verifies ({status})"
+        )
+
+    final_relpath = str(
+        (item.get("target") or {}).get("final_relpath")
+        or Path(relpath).with_suffix(".mp3").as_posix()
+    )
+    final_rel = Path(final_relpath)
+
+    if final_rel.is_absolute() or ".." in final_rel.parts:
+        raise SystemExit(
+            "Refusing audio commit: invalid final_relpath in frozen plan"
+        )
+
+    final_path = root / final_rel
+
+    if final_path != source and final_path.exists():
+        raise SystemExit(
+            f"Refusing audio commit: destination already exists: {final_path}"
+        )
+
+    original_sha = sha256_file(source)
+    staged_sha = sha256_file(staged_path)
+
+    commit_id = sha256_text(
+        canonical_json(
+            {
+                "staging_id": args.staging_id,
+                "relpath": relpath,
+                "operation": "CONVERT_AUDIO",
+                "started": now_iso(),
+            }
+        )
+    )[:16]
+
+    quarantine_dir = state_dir / "quarantine" / commit_id
+    quarantine_path = quarantine_dir / relpath
+    quarantine_path.parent.mkdir(parents=True, exist_ok=False)
+
+    con = init_db(db_path, root)
+    con.row_factory = sqlite3.Row
+
+    asset_row = con.execute(
+        "SELECT asset_id FROM assets WHERE relpath=?",
+        (relpath,),
+    ).fetchone()
+
+    if not asset_row:
+        con.close()
+        raise SystemExit(
+            "Refusing audio commit: source asset is missing from the state database"
+        )
+
+    asset_id = int(asset_row["asset_id"])
+
+    if final_relpath != relpath:
+        conflict = con.execute(
+            "SELECT asset_id FROM assets WHERE relpath=? AND asset_id<>?",
+            (final_relpath, asset_id),
+        ).fetchone()
+
+        if conflict:
+            con.close()
+            raise SystemExit(
+                "Refusing audio commit: destination relpath already belongs "
+                f"to another database asset: {final_relpath}"
+            )
+
+    con.execute(
+        "INSERT INTO commits("
+        "commit_id,staging_id,plan_id,started_at,status,quarantine_dir"
+        ") VALUES(?,?,?,?,?,?)",
+        (
+            commit_id,
+            args.staging_id,
+            plan_id,
+            now_iso(),
+            "RUNNING",
+            str(quarantine_dir),
+        ),
+    )
+    con.commit()
+
+    final_tmp = (
+        final_path.parent
+        / f".{final_path.name}.media-maintenance-{commit_id}.tmp"
+    )
+    moved_to_quarantine = False
+
+    details: dict[str, Any] = {
+        "precommit_verification": verification,
+        "asset_id": asset_id,
+        "original_relpath": relpath,
+        "final_relpath": final_relpath,
+        "policy_version": item.get("policy_version"),
+    }
+
+    try:
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Original leaves the library atomically but is never deleted.
+        os.replace(source, quarantine_path)
+        moved_to_quarantine = True
+        fsync_dir(source.parent)
+        fsync_dir(quarantine_path.parent)
+
+        # Install a separately verified staged copy.
+        shutil.copyfile(staged_path, final_tmp)
+        fsync_file(final_tmp)
+
+        st = staged_path.stat()
+        set_creation_time(final_tmp, getattr(st, "st_birthtime", None))
+        os.utime(final_tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+        staged_personal_tags = [
+            t
+            for t in read_finder_tags_safe(staged_path)
+            if t not in set(cfg.get("personal_tags_exclude", []))
+        ]
+        if staged_personal_tags:
+            tag_ok, tag_msg, _ = copy_personal_finder_tags_xattr(
+                staged_path, final_tmp, cfg
+            )
+            if not tag_ok:
+                raise RuntimeError(
+                    f"could_not_copy_personal_tags_to_final_temp:{tag_msg}"
+                )
+
+        if sha256_file(final_tmp) != staged_sha:
+            raise RuntimeError("temp_copy_hash_mismatch")
+
+        os.replace(final_tmp, final_path)
+        fsync_dir(final_path.parent)
+
+        final_sha = sha256_file(final_path)
+        if final_sha != staged_sha:
+            raise RuntimeError("final_hash_mismatch")
+
+        final_status, final_ver = verify_staged_output(
+            quarantine_path, final_path, item, cfg
+        )
+        details["final_verification"] = final_ver
+
+        if (
+            final_status != "STAGED_VERIFIED"
+            or final_ver.get("metadata_ready_for_commit") is not True
+        ):
+            raise RuntimeError(
+                f"final_audio_verification_failed:{final_status}"
+            )
+
+        fst = final_path.stat()
+
+        con.execute(
+            "UPDATE assets SET "
+            "relpath=?,size=?,mtime_ns=?,birth_ts=?,quick_hash=?,full_hash=?,"
+            "extension=?,audio_codec=?,active=1 WHERE asset_id=?",
+            (
+                final_relpath,
+                int(fst.st_size),
+                int(fst.st_mtime_ns),
+                getattr(fst, "st_birthtime", None),
+                audit.quick_hash(final_path),
+                final_sha,
+                final_path.suffix.lower(),
+                final_ver.get("output_audio_codec"),
+                asset_id,
+            ),
+        )
+
+        con.execute(
+            "INSERT INTO processing_history("
+            "asset_id,policy_version,operation,status,processed_at,"
+            "source_quick_hash,source_full_hash,output_quick_hash,"
+            "output_full_hash,details_json"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                asset_id,
+                item.get("policy_version"),
+                "CONVERT_AUDIO",
+                "COMMITTED",
+                now_iso(),
+                item.get("source_quick_hash"),
+                original_sha,
+                audit.quick_hash(final_path),
+                final_sha,
+                canonical_json(
+                    {
+                        "commit_id": commit_id,
+                        "staging_id": args.staging_id,
+                        "original_relpath": relpath,
+                        "final_relpath": final_relpath,
+                    }
+                ),
+            ),
+        )
+
+        con.execute(
+            "INSERT INTO commit_items("
+            "commit_id,relpath,operation,status,source_original_sha256,"
+            "staged_sha256,final_sha256,quarantine_path,final_path,details_json"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                commit_id,
+                relpath,
+                "CONVERT_AUDIO",
+                "COMMITTED",
+                original_sha,
+                staged_sha,
+                final_sha,
+                str(quarantine_path),
+                str(final_path),
+                canonical_json(details),
+            ),
+        )
+
+        report_path = state_dir / f"commit-{commit_id}.md"
+        report_path.write_text(
+            "\n".join(
+                [
+                    "# Veronica Audio Commit Report",
+                    "",
+                    f"- Tool version: `{VERSION}`",
+                    f"- Commit ID: `{commit_id}`",
+                    f"- Staging ID: `{args.staging_id}`",
+                    f"- Policy: `{item.get('policy_version')}`",
+                    f"- Original file: `{relpath}`",
+                    f"- Installed file: `{final_relpath}`",
+                    f"- Original quarantine: `{quarantine_path}`",
+                    "",
+                    "## Result",
+                    "",
+                    "- Status: **COMMITTED**",
+                    f"- Original SHA-256: `{original_sha}`",
+                    f"- Final SHA-256: `{final_sha}`",
+                    f"- Saving: **{verification.get('saving_percent', 0):.1f}%**",
+                    "",
+                    "## Safety",
+                    "",
+                    "The original was not deleted. It remains in quarantine "
+                    "and can be restored with the rollback command.",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        con.execute(
+            "UPDATE commits SET completed_at=?,status='COMMITTED',report_path=? "
+            "WHERE commit_id=?",
+            (now_iso(), str(report_path), commit_id),
+        )
+        con.commit()
+
+        result = {
+            "status": "COMMITTED",
+            "relpath": relpath,
+            "final_relpath": final_relpath,
+            "commit_id": commit_id,
+            "policy_version": item.get("policy_version"),
+            "quarantine_path": str(quarantine_path),
+            "report_path": str(report_path),
+            "saving_percent": float(
+                verification.get("saving_percent", 0) or 0
+            ),
+        }
+
+        if not quiet:
+            print(f"Veronica {VERSION} audio commit")
+            print("Mode: ONE-AUDIO COMMIT WITH POLICY LOCK + QUARANTINE")
+            print(f"COMMITTED: {relpath} -> {final_relpath}")
+            print(f"Policy: {item.get('policy_version')}")
+            print(f"Original quarantine: {quarantine_path}")
+            print(f"Report: {report_path}")
+            print(f"Commit ID: {commit_id}")
+
+        return result
+
+    except Exception as exc:
+        rollback_note = str(exc)
+
+        try:
+            if final_tmp.exists():
+                final_tmp.unlink()
+
+            if moved_to_quarantine and quarantine_path.exists():
+                if final_path.exists():
+                    failed = (
+                        state_dir
+                        / "failed-commit-output"
+                        / commit_id
+                        / final_relpath
+                    )
+                    failed.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(final_path, failed)
+
+                os.replace(quarantine_path, source)
+                fsync_dir(source.parent)
+
+                if sha256_file(source) == original_sha:
+                    rollback_note += "; original_restored"
+                else:
+                    rollback_note += "; automatic_restore_hash_mismatch"
+
+        finally:
+            con.execute(
+                "INSERT OR REPLACE INTO commit_items("
+                "commit_id,relpath,operation,status,source_original_sha256,"
+                "staged_sha256,quarantine_path,final_path,details_json"
+                ") VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    commit_id,
+                    relpath,
+                    "CONVERT_AUDIO",
+                    "FAILED_ROLLED_BACK",
+                    original_sha,
+                    staged_sha,
+                    str(quarantine_path),
+                    str(final_path),
+                    canonical_json({"error": rollback_note, **details}),
+                ),
+            )
+            con.execute(
+                "UPDATE commits SET completed_at=?,status='FAILED_ROLLED_BACK' "
+                "WHERE commit_id=?",
+                (now_iso(), commit_id),
+            )
+            con.commit()
+
+        raise SystemExit(
+            f"Audio commit failed safely: {rollback_note}"
+        )
+
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
 def choose_video_commit_candidate(report: dict[str, Any], relpath: str) -> dict[str, Any]:
     candidates = [r for r in report.get("results", [])
                   if r.get("status") == "STAGED_VERIFIED"
@@ -3220,6 +3716,12 @@ def cmd_commit_video(args: argparse.Namespace) -> int:
     commit_one_video(args, quiet=False)
     return 0
 
+
+def cmd_commit_audio(args: argparse.Namespace) -> int:
+    commit_one_audio(args, quiet=False)
+    return 0
+
+
 def cmd_commit(args: argparse.Namespace) -> int:
     commit_one(args, quiet=False)
     return 0
@@ -3307,6 +3809,203 @@ def cmd_commit_batch(args: argparse.Namespace) -> int:
     print("Results: " + ", ".join(f"{k}={v}" for k,v in counts.items()))
     print(f"Batch report: {report_path}")
     return 0 if counts.get("FAILED_SAFE",0) == 0 else 1
+
+
+def cmd_commit_audio_batch(args: argparse.Namespace) -> int:
+    if not args.yes:
+        raise SystemExit(
+            "Audio batch commit requires --yes. This command can change up to "
+            "10 audio files; every original is quarantined independently."
+        )
+
+    if args.max_items < 1 or args.max_items > 10:
+        raise SystemExit(
+            "--max-items must be between 1 and 10 for audio"
+        )
+
+    state_dir = Path(args.state_dir).expanduser().resolve()
+    db_path = state_dir / "media-maintenance.sqlite"
+
+    if not db_path.exists():
+        raise SystemExit(f"State database not found: {db_path}")
+
+    report = load_staging_report(state_dir, args.staging_id)
+
+    candidates = [
+        r for r in report.get("results", [])
+        if r.get("status") == "STAGED_VERIFIED"
+        and r.get("operation") == "CONVERT_AUDIO"
+        and r.get("verification", {}).get("metadata_ready_for_commit") is True
+    ]
+
+    requested = list(args.relpath or [])
+    if requested:
+        by_rel = {r.get("relpath"): r for r in candidates}
+        missing = [r for r in requested if r not in by_rel]
+        if missing:
+            raise SystemExit(
+                "Requested relpath(s) are not commit-ready audio files in this "
+                "staging run: " + ", ".join(missing)
+            )
+        candidates = [by_rel[r] for r in requested]
+
+    committed_before = already_committed_relpaths(db_path)
+    candidates = [
+        r for r in candidates
+        if r.get("relpath") not in committed_before
+    ]
+
+    if not candidates:
+        raise SystemExit(
+            "No new commit-ready staged audio files remain in this staging run"
+        )
+
+    selected = candidates[:args.max_items]
+    preflight = preflight_free_space(
+        state_dir,
+        commit_space_estimate(selected),
+        "audio batch commit",
+    )
+
+    batch_id = sha256_text(
+        canonical_json(
+            {
+                "staging_id": args.staging_id,
+                "started": now_iso(),
+                "relpaths": [r["relpath"] for r in selected],
+            }
+        )
+    )[:16]
+
+    print(f"Veronica {VERSION} audio batch commit")
+    print(
+        "Mode: BOUNDED AUDIO BATCH — POLICY LOCKED; "
+        "EACH FILE HAS ITS OWN QUARANTINE TRANSACTION"
+    )
+    print(f"Batch ID: {batch_id}")
+    print(f"Selected: {len(selected)} audio file(s); hard cap=10")
+    print(f"Already committed and skipped: {len(committed_before)}")
+    print(
+        f"Disk preflight: {preflight['free_bytes']/1024**3:.2f} GiB free; "
+        f"estimated commit need {preflight['required_bytes']/1024**3:.2f} GiB "
+        "incl. reserve"
+    )
+
+    results: list[dict[str, Any]] = []
+
+    for idx, r in enumerate(selected, 1):
+        rel = r["relpath"]
+        one_args = argparse.Namespace(
+            staging_id=args.staging_id,
+            state_dir=args.state_dir,
+            config=args.config,
+            relpath=rel,
+            yes=True,
+        )
+
+        try:
+            res = commit_one_audio(one_args, quiet=True)
+            results.append(res)
+            print(
+                f"[{idx}/{len(selected)}] COMMITTED "
+                f"{rel} -> {res['final_relpath']}  commit={res['commit_id']}"
+            )
+            emit_event(
+                "commit_item",
+                media="audio",
+                index=idx,
+                total=len(selected),
+                relpath=rel,
+                final_relpath=res["final_relpath"],
+                status="COMMITTED",
+                commit_id=res["commit_id"],
+            )
+
+        except SystemExit as exc:
+            results.append(
+                {
+                    "status": "FAILED_SAFE",
+                    "relpath": rel,
+                    "error": str(exc),
+                }
+            )
+            print(
+                f"[{idx}/{len(selected)}] FAILED_SAFE {rel}  {exc}"
+            )
+
+        except Exception as exc:
+            results.append(
+                {
+                    "status": "FAILED_SAFE",
+                    "relpath": rel,
+                    "error": repr(exc),
+                }
+            )
+            print(
+                f"[{idx}/{len(selected)}] FAILED_SAFE {rel}  {exc}"
+            )
+
+    counts = Counter(r["status"] for r in results)
+
+    report_path = state_dir / f"audio-batch-commit-{batch_id}.md"
+    lines = [
+        "# Veronica Audio Batch Commit Report",
+        "",
+        f"- Tool version: `{VERSION}`",
+        f"- Batch ID: `{batch_id}`",
+        f"- Staging ID: `{args.staging_id}`",
+        f"- Selected files: **{len(selected)}**",
+        f"- Already committed and skipped: **{len(committed_before)}**",
+        "",
+        "## Results",
+        "",
+        "| Status | Files |",
+        "|---|---:|",
+    ]
+
+    for k, v in counts.items():
+        lines.append(f"| `{k}` | {v} |")
+
+    lines += ["", "## Items", ""]
+
+    for r in results:
+        if r["status"] == "COMMITTED":
+            lines.append(
+                f"- `COMMITTED` — `{r['relpath']}` → "
+                f"`{r['final_relpath']}` — commit `{r['commit_id']}` — "
+                f"saving {r.get('saving_percent', 0):.1f}%"
+            )
+            lines.append(
+                f"  - policy: `{r['policy_version']}`"
+            )
+            lines.append(
+                f"  - original quarantine: `{r['quarantine_path']}`"
+            )
+        else:
+            lines.append(
+                f"- `FAILED_SAFE` — `{r['relpath']}` — "
+                f"{r.get('error', 'unknown error')}"
+            )
+
+    lines += [
+        "",
+        "## Recovery",
+        "",
+        "Every successful audio conversion has its own commit ID and can be "
+        "rolled back independently. A failed item is restored automatically "
+        "and does not invalidate other successful items.",
+        "",
+    ]
+
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+
+    print(
+        "Results: "
+        + ", ".join(f"{k}={v}" for k, v in counts.items())
+    )
+    print(f"Batch report: {report_path}")
+
+    return 0 if counts.get("FAILED_SAFE", 0) == 0 else 1
 
 
 def cmd_commit_video_batch(args: argparse.Namespace) -> int:
@@ -3490,6 +4189,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
     state_dir = Path(args.state_dir).expanduser().resolve()
     state_dir.mkdir(parents=True, exist_ok=True)
     cfg = apply_product_filename_settings(cfg, state_dir)
+    cfg = apply_product_media_processing_settings(cfg, state_dir)
     run_date = dt.date.fromisoformat(args.run_date) if args.run_date else dt.date.today()
     cfg = apply_product_date_scope_settings(cfg, state_dir, run_date)
 
@@ -3865,9 +4565,14 @@ def cmd_run_status(args: argparse.Namespace) -> int:
     print(f"Manual review in plan: {int(ops.get('REVIEW',0)):,}")
     print("Staging records: " + ", ".join(f"{k}={v:,}" for k,v in sorted(stage_counts.items())))
     total_saved=sum(saved_by_op.values())
-    print(f"Recorded committed savings: {total_saved/1024**3:.2f} GiB (images {saved_by_op['CONVERT_IMAGE']/1024**3:.2f}, videos {saved_by_op['CONVERT_VIDEO']/1024**3:.2f})")
+    print(
+        f"Recorded committed savings: {total_saved/1024**3:.2f} GiB "
+        f"(images {saved_by_op['CONVERT_IMAGE']/1024**3:.2f}, "
+        f"videos {saved_by_op['CONVERT_VIDEO']/1024**3:.2f}, "
+        f"audio {saved_by_op['CONVERT_AUDIO']/1024**3:.2f})"
+    )
     estimates=[]
-    for op in ("CONVERT_IMAGE","CONVERT_VIDEO"):
+    for op in ("CONVERT_IMAGE","CONVERT_VIDEO","CONVERT_AUDIO"):
         if op not in medians or not plan_by_op[op]: continue
         remaining_rels=plan_by_op[op]-committed_by_op[op]-resolved_by_op[op]
         est=sum(source_size.get(r,0) for r in remaining_rels)*(medians[op]/100.0)
@@ -3885,10 +4590,14 @@ def cmd_next_batch(args: argparse.Namespace) -> int:
     state_dir=Path(args.state_dir).expanduser().resolve()
     db=state_dir/"media-maintenance.sqlite"
     if not db.exists(): raise SystemExit(f"No state database found: {db}")
-    op="CONVERT_IMAGE" if args.media=="image" else "CONVERT_VIDEO"
+    op = {
+        "image": "CONVERT_IMAGE",
+        "video": "CONVERT_VIDEO",
+        "audio": "CONVERT_AUDIO",
+    }[args.media]
     plan=load_plan(Path(args.plan).expanduser().resolve())
     plan_id=plan["plan_id"]
-    hard=250 if args.media=="image" else 50
+    hard = {"image": 250, "video": 50, "audio": 10}[args.media]
     if args.count < 1 or args.count > hard:
         raise SystemExit(f"--count must be between 1 and {hard} for {args.media}")
     con=sqlite3.connect(db); con.row_factory=sqlite3.Row
@@ -3906,7 +4615,8 @@ def cmd_next_batch(args: argparse.Namespace) -> int:
     ns=argparse.Namespace(plan=args.plan,state_dir=args.state_dir,config=args.config,
                           max_images=args.count if args.media=="image" else 0,
                           max_videos=args.count if args.media=="video" else 0,
-                          max_audio=0,sample_strategy="first",require_personal_tag_sample=False)
+                          max_audio=args.count if args.media=="audio" else 0,
+                          sample_strategy="first",require_personal_tag_sample=False)
     return cmd_stage(ns)
 
 
@@ -3934,7 +4644,7 @@ def cmd_cleanup_superseded(args: argparse.Namespace) -> int:
         rows=list(con.execute("SELECT relpath,operation,status FROM staging_items WHERE staging_id=?",(run["staging_id"],)))
         # Runs from an older frozen plan are superseded by definition when --plan is supplied.
         superseded = bool(plan_id and run["plan_id"] != plan_id)
-        blockers=[] if superseded else [r for r in rows if r["status"]=='STAGED_VERIFIED' and r["operation"] in ('CONVERT_IMAGE','CONVERT_VIDEO') and r["relpath"] not in committed]
+        blockers=[] if superseded else [r for r in rows if r["status"]=='STAGED_VERIFIED' and r["operation"] in ('CONVERT_IMAGE','CONVERT_VIDEO','CONVERT_AUDIO') and r["relpath"] not in committed]
         path=Path(run["staging_dir"])
         rec={"id":run["staging_id"],"path":path,"size":_staging_dir_size(path),"blockers":len(blockers),"superseded":superseded}
         (blocked if blockers else candidates).append(rec)
@@ -3962,7 +4672,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     committed = already_committed_relpaths(db) if db.exists() else set()
     blockers=[]
     for r in report.get("results",[]):
-        if r.get("status")=="STAGED_VERIFIED" and r.get("operation") in ("CONVERT_IMAGE","CONVERT_VIDEO") and r.get("verification",{}).get("metadata_ready_for_commit") is True:
+        if r.get("status")=="STAGED_VERIFIED" and r.get("operation") in ("CONVERT_IMAGE","CONVERT_VIDEO","CONVERT_AUDIO") and r.get("verification",{}).get("metadata_ready_for_commit") is True:
             if r.get("relpath") not in committed:
                 blockers.append(r.get("relpath"))
     stage_dir = state_dir / "staging" / args.staging_id
@@ -4097,6 +4807,36 @@ def cmd_configure_filenames(args: argparse.Namespace) -> int:
     ))
     return 0
 
+
+
+def cmd_configure_media_types(args: argparse.Namespace) -> int:
+    """Persist which media types Veronica is permitted to modify."""
+    state_dir = Path(args.state_dir).expanduser().resolve()
+
+    values = {
+        "images": args.images,
+        "videos": args.videos,
+        "audio": args.audio,
+    }
+
+    for name, value in values.items():
+        if value not in {"true", "false"}:
+            raise SystemExit(f"--{name} must be true or false")
+
+    current = load_product_settings(state_dir)
+    current["process_images"] = args.images == "true"
+    current["process_videos"] = args.videos == "true"
+    current["process_audio"] = args.audio == "true"
+    current["media_processing_settings_updated_at"] = now_iso()
+
+    save_product_settings(state_dir, current)
+
+    print(json.dumps(
+        media_processing_product_settings(state_dir),
+        ensure_ascii=False,
+        sort_keys=True,
+    ))
+    return 0
 
 def cmd_configure_date_scope(args: argparse.Namespace) -> int:
     """Persist the date range used to decide which media is eligible."""
@@ -4536,6 +5276,7 @@ def cmd_ui_snapshot(args: argparse.Namespace) -> int:
         "unresolved_reviews": unresolved_reviews,
         "recent_changes": recent_changes,
         "filename_policy": filename_product_settings(state_dir),
+        "media_processing": media_processing_product_settings(state_dir),
         "date_scope": date_scope_product_settings(state_dir, today),
         "preflight": dependency_status(),
     }
@@ -4639,6 +5380,7 @@ def _annual_write_report(state_dir: Path, plan: dict[str, Any], status: str, sta
                 f"keep_original={rec.get('kept',0)}, committed_renames={rec.get('committed_renames',0)}, "
                 f"committed_images={rec.get('committed_images',0)}, "
                 f"committed_videos={rec.get('committed_videos',0)}, "
+                f"committed_audio={rec.get('committed_audio',0)}, "
                 f"committed_saving={int(rec.get('committed_saving_bytes',0) or 0)/1024**2:.1f} MiB"
             )
     else:
@@ -4707,6 +5449,7 @@ def cmd_annual_all(args: argparse.Namespace) -> int:
             rename_batch=args.rename_batch,
             image_batch=args.image_batch,
             video_batch=args.video_batch,
+            audio_batch=args.audio_batch,
             yes=True,
             events_jsonl=args.events_jsonl,
         )
@@ -4738,6 +5481,8 @@ def cmd_annual(args: argparse.Namespace) -> int:
         raise SystemExit("--image-batch must be between 1 and 250")
     if args.video_batch < 1 or args.video_batch > 25:
         raise SystemExit("--video-batch must be between 1 and 25")
+    if args.audio_batch < 1 or args.audio_batch > 10:
+        raise SystemExit("--audio-batch must be between 1 and 10")
 
     state_dir = Path(args.state_dir).expanduser().resolve()
     root = require_archive_root(state_dir, args.root)
@@ -4826,7 +5571,7 @@ def cmd_annual(args: argparse.Namespace) -> int:
     remaining = _annual_remaining(plan, state_dir)
     unsupported = [
         i for i in remaining
-        if i.get("operation") not in {"RENAME", "CONVERT_IMAGE", "CONVERT_VIDEO"}
+        if i.get("operation") not in {"RENAME", "CONVERT_IMAGE", "CONVERT_VIDEO", "CONVERT_AUDIO"}
     ]
     if unsupported:
         kinds = Counter(i.get("operation") for i in unsupported)
@@ -4857,7 +5602,8 @@ def cmd_annual(args: argparse.Namespace) -> int:
                 f"\nAnnual batch {guard}: "
                 f"remaining renames={counts.get('RENAME',0)} "
                 f"images={counts.get('CONVERT_IMAGE',0)} "
-                f"videos={counts.get('CONVERT_VIDEO',0)}"
+                f"videos={counts.get('CONVERT_VIDEO',0)} "
+                f"audio={counts.get('CONVERT_AUDIO',0)}"
             )
             emit_event(
                 "batch_started",
@@ -4865,6 +5611,7 @@ def cmd_annual(args: argparse.Namespace) -> int:
                 remaining_renames=counts.get("RENAME", 0),
                 remaining_images=counts.get("CONVERT_IMAGE", 0),
                 remaining_videos=counts.get("CONVERT_VIDEO", 0),
+                remaining_audio=counts.get("CONVERT_AUDIO", 0),
             )
 
             rec = {
@@ -4874,6 +5621,7 @@ def cmd_annual(args: argparse.Namespace) -> int:
                 "committed_renames": 0,
                 "committed_images": 0,
                 "committed_videos": 0,
+                "committed_audio": 0,
                 "committed_saving_bytes": 0,
             }
 
@@ -4936,11 +5684,13 @@ def cmd_annual(args: argparse.Namespace) -> int:
 
         max_images = min(args.image_batch, counts.get("CONVERT_IMAGE", 0))
         max_videos = min(args.video_batch, counts.get("CONVERT_VIDEO", 0))
+        max_audio = min(args.audio_batch, counts.get("CONVERT_AUDIO", 0))
         print(
             f"\nAnnual batch {guard}: "
             f"remaining renames={counts.get('RENAME',0)} "
             f"images={counts.get('CONVERT_IMAGE',0)} "
-            f"videos={counts.get('CONVERT_VIDEO',0)}"
+            f"videos={counts.get('CONVERT_VIDEO',0)} "
+            f"audio={counts.get('CONVERT_AUDIO',0)}"
         )
         emit_event(
             "batch_started",
@@ -4948,10 +5698,11 @@ def cmd_annual(args: argparse.Namespace) -> int:
             remaining_renames=counts.get("RENAME", 0),
             remaining_images=counts.get("CONVERT_IMAGE", 0),
             remaining_videos=counts.get("CONVERT_VIDEO", 0),
+            remaining_audio=counts.get("CONVERT_AUDIO", 0),
         )
         stage_args = argparse.Namespace(
             plan=str(plan_path), state_dir=str(state_dir), config=args.config,
-            max_images=max_images, max_videos=max_videos, max_audio=0,
+            max_images=max_images, max_videos=max_videos, max_audio=max_audio,
             sample_strategy="first", require_personal_tag_sample=False,
         )
         rc = cmd_stage(stage_args)
@@ -4963,14 +5714,14 @@ def cmd_annual(args: argparse.Namespace) -> int:
         if not staging_id:
             raise SystemExit("Annual controller could not locate the staging run it just created")
         staging = load_staging_report(state_dir, staging_id)
-        results = [r for r in staging.get("results", []) if r.get("operation") in {"CONVERT_IMAGE", "CONVERT_VIDEO"}]
+        results = [r for r in staging.get("results", []) if r.get("operation") in {"CONVERT_IMAGE", "CONVERT_VIDEO", "CONVERT_AUDIO"}]
         anomalous = [r for r in results if r.get("status") not in {"STAGED_VERIFIED", "KEEP_ORIGINAL"}]
         blocked = [r for r in results if r.get("status") == "STAGED_VERIFIED" and r.get("verification", {}).get("metadata_ready_for_commit") is not True]
         rec = {
             "staging_id": staging_id,
             "verified": sum(1 for r in results if r.get("status") == "STAGED_VERIFIED"),
             "kept": sum(1 for r in results if r.get("status") == "KEEP_ORIGINAL"),
-            "committed_images": 0, "committed_videos": 0, "committed_saving_bytes": 0,
+            "committed_images": 0, "committed_videos": 0, "committed_audio": 0, "committed_saving_bytes": 0,
         }
         batches.append(rec)
         if anomalous or blocked:
@@ -4985,6 +5736,7 @@ def cmd_annual(args: argparse.Namespace) -> int:
 
         image_ready = [r for r in results if r.get("status") == "STAGED_VERIFIED" and r.get("operation") == "CONVERT_IMAGE"]
         video_ready = [r for r in results if r.get("status") == "STAGED_VERIFIED" and r.get("operation") == "CONVERT_VIDEO"]
+        audio_ready = [r for r in results if r.get("status") == "STAGED_VERIFIED" and r.get("operation") == "CONVERT_AUDIO"]
         if image_ready:
             commit_args = argparse.Namespace(staging_id=staging_id, state_dir=str(state_dir), config=args.config,
                                              max_items=len(image_ready), relpath=None, yes=True)
@@ -5007,6 +5759,33 @@ def cmd_annual(args: argparse.Namespace) -> int:
                 return rc
             rec["committed_videos"] = len(video_ready)
             rec["committed_saving_bytes"] += sum(int(r.get("verification", {}).get("saving_bytes") or 0) for r in video_ready)
+
+        if audio_ready:
+            commit_args = argparse.Namespace(
+                staging_id=staging_id,
+                state_dir=str(state_dir),
+                config=args.config,
+                max_items=len(audio_ready),
+                relpath=None,
+                yes=True,
+            )
+            rc = cmd_commit_audio_batch(commit_args)
+            if rc != 0:
+                report = _annual_write_report(
+                    state_dir,
+                    plan,
+                    "STOPPED_COMMIT_FAILURE",
+                    started_at,
+                    batches,
+                    f"Audio commit batch from staging `{staging_id}` reported a safe failure.",
+                )
+                print(f"Annual report: {report}")
+                return rc
+            rec["committed_audio"] = len(audio_ready)
+            rec["committed_saving_bytes"] += sum(
+                int(r.get("verification", {}).get("saving_bytes") or 0)
+                for r in audio_ready
+            )
 
         new_remaining = _annual_remaining(plan, state_dir)
         if len(new_remaining) >= len(remaining):
@@ -5082,6 +5861,7 @@ def main() -> int:
     paa.add_argument("--rename-batch", type=int, default=250, help="bounded filename-only rename window; max 250")
     paa.add_argument("--image-batch", type=int, default=250, help="bounded image staging/commit window; max 250")
     paa.add_argument("--video-batch", type=int, default=25, help="bounded video staging/commit window; max 25")
+    paa.add_argument("--audio-batch", type=int, default=10, help="bounded audio staging/commit window; max 10")
     paa.add_argument("--yes", action="store_true", help="required acknowledgement that verified media may be committed")
     paa.add_argument("--events-jsonl", help="optional JSON-lines progress/event file for the Veronica GUI")
 
@@ -5093,6 +5873,7 @@ def main() -> int:
     pa.add_argument("--rename-batch", type=int, default=250, help="bounded filename-only rename window; max 250")
     pa.add_argument("--image-batch", type=int, default=250, help="bounded image staging/commit window; max 250")
     pa.add_argument("--video-batch", type=int, default=25, help="bounded video staging/commit window; max 25")
+    pa.add_argument("--audio-batch", type=int, default=10, help="bounded audio staging/commit window; max 10")
     pa.add_argument("--yes", action="store_true", help="required acknowledgement that verified media may be committed")
     pa.add_argument("--events-jsonl", help="optional JSON-lines progress/event file for the Veronica GUI")
     pp = sub.add_parser("plan", help="scan, migrate legacy tags to SQLite, and create an immutable plan")
@@ -5115,6 +5896,21 @@ def main() -> int:
     pc.add_argument("--config")
     pc.add_argument("--relpath", required=True, help="exact staged relpath to commit")
     pc.add_argument("--yes", action="store_true", help="required explicit acknowledgement")
+    pca = sub.add_parser("commit-audio", help="commit exactly one policy-matched verified staged audio file; original is quarantined")
+    pca.add_argument("--staging-id", required=True)
+    pca.add_argument("--state-dir", required=True)
+    pca.add_argument("--config")
+    pca.add_argument("--relpath", required=True, help="exact original audio relpath from the frozen plan")
+    pca.add_argument("--yes", action="store_true", help="required explicit acknowledgement")
+
+    pcab = sub.add_parser("commit-audio-batch", help="commit up to 10 policy-matched verified staged audio files; each original is quarantined independently")
+    pcab.add_argument("--staging-id", required=True)
+    pcab.add_argument("--state-dir", required=True)
+    pcab.add_argument("--config")
+    pcab.add_argument("--max-items", type=int, default=10)
+    pcab.add_argument("--relpath", action="append", help="optional exact original audio relpath; repeat to choose explicit files")
+    pcab.add_argument("--yes", action="store_true", help="required explicit acknowledgement")
+
     pcv = sub.add_parser("commit-video", help="commit exactly one policy-matched verified staged video; original is quarantined and .mov/.m4v becomes .mp4")
     pcv.add_argument("--staging-id", required=True)
     pcv.add_argument("--state-dir", required=True)
@@ -5157,6 +5953,12 @@ def main() -> int:
     pfn.add_argument("--date-format", default="YYYY-MM-DD_")
     pfn.add_argument("--max-bytes", type=int, required=True)
 
+    pmedia = sub.add_parser("configure-media-types", help="store which media types Veronica may process")
+    pmedia.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
+    pmedia.add_argument("--images", choices=["true", "false"], required=True)
+    pmedia.add_argument("--videos", choices=["true", "false"], required=True)
+    pmedia.add_argument("--audio", choices=["true", "false"], required=True)
+
     pscope = sub.add_parser("configure-date-scope", help="store Veronica date-scope preferences")
     pscope.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
     pscope.add_argument("--mode", choices=["all", "within", "outside"], required=True)
@@ -5187,7 +5989,7 @@ def main() -> int:
     pnb.add_argument("--plan", required=True)
     pnb.add_argument("--state-dir", required=True)
     pnb.add_argument("--config")
-    pnb.add_argument("--media", choices=["image","video"], required=True)
+    pnb.add_argument("--media", choices=["image","video","audio"], required=True)
     pnb.add_argument("--count", type=int, required=True)
     pnb.add_argument("--allow-overlap", action="store_true", help="deliberately allow duplicate staging while older verified outputs remain uncommitted")
     pcs = sub.add_parser("cleanup-superseded", help="dry-run/remove staging directories with no uncommitted verified image/video outputs; never deletes quarantine")
@@ -5206,6 +6008,8 @@ def main() -> int:
     if args.cmd == "plan": return cmd_plan(args)
     if args.cmd == "stage": return cmd_stage(args)
     if args.cmd == "commit": return cmd_commit(args)
+    if args.cmd == "commit-audio": return cmd_commit_audio(args)
+    if args.cmd == "commit-audio-batch": return cmd_commit_audio_batch(args)
     if args.cmd == "commit-video": return cmd_commit_video(args)
     if args.cmd == "commit-video-batch": return cmd_commit_video_batch(args)
     if args.cmd == "commit-batch": return cmd_commit_batch(args)
@@ -5213,6 +6017,7 @@ def main() -> int:
     if args.cmd == "rollback": return cmd_rollback(args)
     if args.cmd == "resolve-review": return cmd_resolve_review(args)
     if args.cmd == "configure-filenames": return cmd_configure_filenames(args)
+    if args.cmd == "configure-media-types": return cmd_configure_media_types(args)
     if args.cmd == "configure-date-scope": return cmd_configure_date_scope(args)
     if args.cmd == "configure-folders": return cmd_configure_folders(args)
     if args.cmd == "configure-library": return cmd_configure_library(args)
