@@ -22,10 +22,9 @@ private struct WindowChromeConfigurator: NSViewRepresentable {
     private func configure(_ window: NSWindow?) {
         guard let window else { return }
 
-        // Veronica currently has an intentionally light-only visual theme.
-        // Match the native AppKit window chrome to the SwiftUI content.
-        window.appearance = NSAppearance(named: .aqua)
-        window.backgroundColor = .white
+        // Follow the user's system appearance. SwiftUI and AppKit controls
+        // inherit the current light/dark appearance from the window.
+        window.backgroundColor = .windowBackgroundColor
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.toolbarStyle = .unified
@@ -35,20 +34,20 @@ private struct WindowChromeConfigurator: NSViewRepresentable {
 
 enum VeronicaTheme {
     // Brand palette:
-    // 60% white / 30% black structure / 10% Indigo Bloom
-    static let canvas = Color.white
-    static let ink = Color.black
+    // Adaptive system surfaces / semantic ink / Indigo Bloom accent
+    static let canvas = Color(nsColor: .windowBackgroundColor)
+    static let ink = Color(nsColor: .labelColor)
     static let accent = Color(
         red: 129.0 / 255.0,
         green: 60.0 / 255.0,
         blue: 176.0 / 255.0
     )
 
-    static let subtleFill = Color.black.opacity(0.035)
-    static let strongerFill = Color.black.opacity(0.055)
-    static let border = Color.black.opacity(0.075)
-    static let secondaryInk = Color.black.opacity(0.58)
-    static let tertiaryInk = Color.black.opacity(0.38)
+    static let subtleFill = Color(nsColor: .controlBackgroundColor)
+    static let strongerFill = Color(nsColor: .underPageBackgroundColor)
+    static let border = Color(nsColor: .separatorColor)
+    static let secondaryInk = Color(nsColor: .secondaryLabelColor)
+    static let tertiaryInk = Color(nsColor: .tertiaryLabelColor)
     static let accentFill = accent.opacity(0.085)
 }
 
