@@ -7,6 +7,7 @@ struct VeronicaApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .preferredColorScheme(.light)
                 .environmentObject(model)
                 .frame(minWidth: 860, minHeight: 600)
                 .task {
