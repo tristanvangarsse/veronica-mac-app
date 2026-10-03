@@ -95,12 +95,12 @@ struct SettingsView: View {
                     .padding(.vertical, 4)
                 }
                 GroupBox("Media to process") {
-                    if let media = model.snapshot?.mediaProcessing {
+                    if model.snapshot?.mediaProcessing != nil {
                         VStack(alignment: .leading, spacing: 14) {
                             Toggle(
                                 "Images",
                                 isOn: Binding(
-                                    get: { media.images },
+                                    get: { model.processImages },
                                     set: { value in
                                         Task {
                                             await model.updateMediaProcessing(images: value)
@@ -112,7 +112,7 @@ struct SettingsView: View {
                             Toggle(
                                 "Videos",
                                 isOn: Binding(
-                                    get: { media.videos },
+                                    get: { model.processVideos },
                                     set: { value in
                                         Task {
                                             await model.updateMediaProcessing(videos: value)
@@ -124,7 +124,7 @@ struct SettingsView: View {
                             Toggle(
                                 "Audio",
                                 isOn: Binding(
-                                    get: { media.audio },
+                                    get: { model.processAudio },
                                     set: { value in
                                         Task {
                                             await model.updateMediaProcessing(audio: value)
@@ -138,7 +138,7 @@ struct SettingsView: View {
                                 .foregroundStyle(.secondary)
                         }
                         .padding(.vertical, 4)
-                        .disabled(model.isRunningAnnual || model.isLoading)
+                        .disabled(model.isRunningAnnual)
                     }
                 }
 

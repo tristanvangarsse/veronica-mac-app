@@ -12,6 +12,18 @@ final class AppModel: ObservableObject {
     @Published var events: [EngineEvent] = []
     @Published var developerMode = DiagnosticsCenter.shared.developerMode
 
+    // Immediate UI state for the media-processing toggles.
+    // The engine remains the durable source of truth; refresh() reconciles these.
+    @Published var processImages = true
+    @Published var processVideos = true
+    @Published var processAudio = true
+    @Published var isUpdatingMediaProcessing = false
+
+    // Media switches are intentionally optimistic. Multiple quick changes are
+    // coalesced and persisted serially so a slow engine write never drops a
+    // later click.
+    private var mediaProcessingSaveRequested = false
+
     func refresh() async {
         DiagnosticsCenter.shared.log("INFO", "App", "Refreshing UI snapshot")
         isLoading = true
@@ -19,6 +31,10 @@ final class AppModel: ObservableObject {
         do {
             let refreshed = try await EngineRunner.shared.snapshot()
             snapshot = refreshed
+
+            processImages = refreshed.mediaProcessing.images
+            processVideos = refreshed.mediaProcessing.videos
+            processAudio = refreshed.mediaProcessing.audio
 
             let missing = refreshed.preflight.missingRequirements
             if missing.isEmpty {
@@ -37,26 +53,67 @@ final class AppModel: ObservableObject {
         videos: Bool? = nil,
         audio: Bool? = nil
     ) async {
-        guard let current = snapshot?.mediaProcessing else { return }
+        // Update the visible controls immediately.
+        if let images {
+            processImages = images
+        }
+        if let videos {
+            processVideos = videos
+        }
+        if let audio {
+            processAudio = audio
+        }
 
-        let nextImages = images ?? current.images
-        let nextVideos = videos ?? current.videos
-        let nextAudio = audio ?? current.audio
+        mediaProcessingSaveRequested = true
 
-        do {
-            try await EngineRunner.shared.configureMediaProcessing(
-                images: nextImages,
-                videos: nextVideos,
-                audio: nextAudio
-            )
-            await refresh()
-        } catch {
-            errorMessage = error.localizedDescription
-            DiagnosticsCenter.shared.log(
-                "ERROR",
-                "App",
-                "Could not update media processing settings: \(error.localizedDescription)"
-            )
+        // If a persistence loop is already running, it will pick up the
+        // current values before it finishes. Do not discard this click.
+        guard !isUpdatingMediaProcessing else { return }
+
+        isUpdatingMediaProcessing = true
+        defer { isUpdatingMediaProcessing = false }
+
+        while mediaProcessingSaveRequested {
+            // Clear the request and briefly debounce. Any clicks arriving
+            // during this pause update the published values above.
+            mediaProcessingSaveRequested = false
+            try? await Task.sleep(nanoseconds: 300_000_000)
+
+            // The values below are the newest combined state. Clear the flag
+            // again so only changes that arrive during the engine command
+            // cause another pass through the loop.
+            mediaProcessingSaveRequested = false
+
+            let targetImages = processImages
+            let targetVideos = processVideos
+            let targetAudio = processAudio
+
+            do {
+                try await EngineRunner.shared.configureMediaProcessing(
+                    images: targetImages,
+                    videos: targetVideos,
+                    audio: targetAudio
+                )
+
+                DiagnosticsCenter.shared.log(
+                    "INFO",
+                    "App",
+                    "Saved media processing settings: images=\(targetImages), videos=\(targetVideos), audio=\(targetAudio)"
+                )
+            } catch {
+                mediaProcessingSaveRequested = false
+
+                errorMessage = error.localizedDescription
+                DiagnosticsCenter.shared.log(
+                    "ERROR",
+                    "App",
+                    "Could not update media processing settings: \(error.localizedDescription)"
+                )
+
+                // Persistence failed, so reload the durable engine state.
+                await refresh()
+                return
+            }
         }
     }
 
