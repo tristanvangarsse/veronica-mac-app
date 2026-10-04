@@ -40,8 +40,19 @@ final class AppModel: ObservableObject {
         ).first ?? fm.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support", isDirectory: true)
 
+#if DEBUG
+        let directory: URL
+        if let stateDir = ProcessInfo.processInfo.environment["VERONICA_STATE_DIR"],
+           !stateDir.isEmpty {
+            directory = URL(fileURLWithPath: stateDir, isDirectory: true)
+        } else {
+            directory = appSupport
+                .appendingPathComponent("Veronica", isDirectory: true)
+        }
+#else
         let directory = appSupport
             .appendingPathComponent("Veronica", isDirectory: true)
+#endif
 
         snapshotCacheURL = directory
             .appendingPathComponent("ui-snapshot-cache.json")

@@ -112,16 +112,44 @@ final class EngineRunner {
     }
 
     func run(_ arguments: [String], onOutput: (@Sendable (String) -> Void)? = nil) async throws -> EngineResult {
-        DiagnosticsCenter.shared.log("INFO", "Engine", "Starting command: \(arguments.first ?? "unknown")")
+        var effectiveArguments = arguments
+
+#if DEBUG
+        if let stateDir = ProcessInfo.processInfo.environment["VERONICA_STATE_DIR"],
+           !stateDir.isEmpty,
+           !effectiveArguments.contains("--state-dir") {
+            let commandsWithStateDir: Set<String> = [
+                "annual-all",
+                "annual",
+                "ui-snapshot",
+                "configure-folders",
+                "configure-media-types",
+                "configure-date-scope",
+                "configure-filenames",
+                "configure-library",
+                "preflight",
+                "status",
+                "run-status",
+                "resolve-review"
+            ]
+
+            if let command = effectiveArguments.first,
+               commandsWithStateDir.contains(command) {
+                effectiveArguments += ["--state-dir", stateDir]
+            }
+        }
+#endif
+
+        DiagnosticsCenter.shared.log("INFO", "Engine", "Starting command: \(effectiveArguments.first ?? "unknown")")
         let process = Process()
         if let executable = standaloneEngineURL() {
             process.executableURL = executable
-            process.arguments = arguments
+            process.arguments = effectiveArguments
             process.currentDirectoryURL = executable.deletingLastPathComponent()
         } else {
             let engine = try engineScriptURL()
             process.executableURL = try pythonURL()
-            process.arguments = [engine.path] + arguments
+            process.arguments = [engine.path] + effectiveArguments
             process.currentDirectoryURL = engine.deletingLastPathComponent()
         }
         process.environment = environment()
@@ -153,13 +181,13 @@ final class EngineRunner {
                 accumulator.append(errTail, isError: true)
                 let collected = accumulator.strings()
                 if let text = String(data: outTail + errTail, encoding: .utf8), !text.isEmpty { onOutput?(text) }
-                DiagnosticsCenter.shared.log(process.terminationStatus == 0 ? "INFO" : "ERROR", "Engine", "Command \(arguments.first ?? "unknown") exited \(process.terminationStatus)")
+                DiagnosticsCenter.shared.log(process.terminationStatus == 0 ? "INFO" : "ERROR", "Engine", "Command \(effectiveArguments.first ?? "unknown") exited \(process.terminationStatus)")
                 if DiagnosticsCenter.shared.developerMode && !collected.stderr.isEmpty { DiagnosticsCenter.shared.log("DEBUG", "Engine stderr", collected.stderr) }
                 continuation.resume(returning: EngineResult(exitCode: process.terminationStatus, stdout: collected.stdout, stderr: collected.stderr))
             }
             do { try process.run() }
             catch {
-                DiagnosticsCenter.shared.log("ERROR", "Engine", "Failed to launch command \(arguments.first ?? "unknown"): \(error.localizedDescription)")
+                DiagnosticsCenter.shared.log("ERROR", "Engine", "Failed to launch command \(effectiveArguments.first ?? "unknown"): \(error.localizedDescription)")
                 continuation.resume(throwing: error)
             }
         }

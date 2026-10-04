@@ -15,7 +15,13 @@ final class DiagnosticsCenter: @unchecked Sendable {
     }
 
     var stateDirectory: URL {
-        fm.homeDirectoryForCurrentUser
+#if DEBUG
+        if let stateDir = ProcessInfo.processInfo.environment["VERONICA_STATE_DIR"],
+           !stateDir.isEmpty {
+            return URL(fileURLWithPath: stateDir, isDirectory: true)
+        }
+#endif
+        return fm.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/Veronica", isDirectory: true)
     }
 
