@@ -4319,6 +4319,44 @@ def cmd_plan(args: argparse.Namespace) -> int:
         item = make_item(policy_row, asset_id, cfg)
         item = apply_filename_policy(item, row, cfg)
 
+        # A file already produced and committed by Veronica remains complete
+        # when the active bytes still match the exact committed output.
+        #
+        # This check must precede date-only REVIEW handling. HandBrake outputs
+        # may contain a new embedded creation_time while Veronica deliberately
+        # restores the source filesystem dates. A later audit can therefore
+        # report date_conflict even though the installed video is exactly the
+        # verified output Veronica committed.
+        #
+        # Preserve hard safety/product boundaries: only override a date-related
+        # REVIEW for an enabled video. Other review reasons continue normally.
+        historical_date_review = (
+            row.get("detected_kind") == "video"
+            and item.get("operation") == "REVIEW"
+            and (
+                "date_low_confidence" in str(item.get("reason") or "")
+                or "date_conflict" in str(item.get("reason") or "")
+            )
+        )
+        if historical_date_review:
+            historical = historical_video_completion(
+                con, asset_id, row.get("quick_hash"), row.get("full_hash")
+            )
+            if historical is not None:
+                item.update(
+                    operation="SKIP_PROCESSED_VIDEO",
+                    policy_version=None,
+                    executable=False,
+                    reason="sqlite_historical_video_processing_history",
+                    target={
+                        **item.get("target", {}),
+                        "completed_policy_version": historical["policy_version"],
+                        "completed_at": historical["processed_at"],
+                        "accepted_as_historical_completion": True,
+                        "suppressed_review_reason": row.get("reason"),
+                    },
+                )
+
         if process_normally is not None:
             item["target"] = {
                 **item.get("target", {}),
