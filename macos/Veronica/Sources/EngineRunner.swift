@@ -51,11 +51,21 @@ final class EngineRunner {
     }
 
     private func standaloneEngineURL() -> URL? {
+#if DEBUG
+        // Development builds intentionally use the bundled Python source.
+        //
+        // The release engine is packaged separately and may have meaningful
+        // startup overhead. Using the source engine here keeps development
+        // launches and UI iteration effectively instantaneous while exercising
+        // the same CLI contract as the packaged engine.
+        return nil
+#else
         let candidates = [
             resourceURL("VeronicaEngine", "veronica-engine"),
             resourceURL("veronica-engine")
         ].compactMap { $0 }
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
+#endif
     }
 
     private func engineScriptURL() throws -> URL {

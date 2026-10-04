@@ -26,8 +26,7 @@ struct DashboardView: View {
                     planCard(s)
                     recentCard(s)
                 } else if model.isLoading {
-                    ProgressView("Reading Veronica state…")
-                        .frame(maxWidth: .infinity, minHeight: 260)
+                    coldStartSkeleton
                 } else {
                     EmptyStateView(title: "Veronica couldn't read its state", systemImage: "exclamationmark.triangle", message: model.errorMessage ?? "Refresh to try again.")
                 }
@@ -65,16 +64,144 @@ struct DashboardView: View {
                 }
             }
             Spacer()
+
+            if model.isLoading && !model.hasLiveSnapshot {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+
+                    Text(model.snapshot == nil ? "Loading…" : "Refreshing…")
+                        .font(.caption)
+                        .foregroundStyle(VeronicaTheme.secondaryInk)
+                }
+                .help(
+                    model.snapshot == nil
+                        ? "Loading Veronica's current state."
+                        : "Verifying current folders, tools, and state."
+                )
+            }
+
             Button {
                 confirmRun = true
             } label: {
-                Label(model.isRunningAnnual ? "Running…" : "Run Veronica", systemImage: model.isRunningAnnual ? "hourglass" : "play.fill")
+                Label(
+                    model.isRunningAnnual ? "Running…" : "Run Veronica",
+                    systemImage: model.isRunningAnnual ? "hourglass" : "play.fill"
+                )
             }
             .buttonStyle(.borderedProminent)
             .tint(VeronicaTheme.accent)
             .controlSize(.large)
-            .disabled(model.isRunningAnnual || model.snapshot?.archiveAvailable != true || model.snapshot?.preflight.requiredToolsReady != true)
+            .disabled(
+                !model.hasLiveSnapshot
+                || model.isRunningAnnual
+                || model.snapshot?.archiveAvailable != true
+                || model.snapshot?.preflight.requiredToolsReady != true
+            )
         }
+    }
+
+    private var coldStartSkeleton: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            HStack(spacing: 14) {
+                Circle()
+                    .fill(VeronicaTheme.strongerFill)
+                    .frame(width: 38, height: 38)
+
+                VStack(alignment: .leading, spacing: 7) {
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(VeronicaTheme.strongerFill)
+                        .frame(width: 170, height: 15)
+
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(VeronicaTheme.strongerFill)
+                        .frame(width: 360, height: 11)
+                }
+
+                Spacer()
+            }
+            .padding(18)
+            .background(
+                VeronicaTheme.accentFill,
+                in: RoundedRectangle(
+                    cornerRadius: 14,
+                    style: .continuous
+                )
+            )
+            .overlay {
+                RoundedRectangle(
+                    cornerRadius: 14,
+                    style: .continuous
+                )
+                .stroke(
+                    VeronicaTheme.accent.opacity(0.10),
+                    lineWidth: 1
+                )
+            }
+
+            HStack(spacing: 12) {
+                ForEach(0..<4, id: \.self) { _ in
+                    ColdStartMetricCard()
+                }
+            }
+
+            GroupBox("Latest maintenance plan") {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(0..<5, id: \.self) { index in
+                        HStack(spacing: 28) {
+                            RoundedRectangle(cornerRadius: 3)
+                                .fill(VeronicaTheme.strongerFill)
+                                .frame(
+                                    width: index == 1 ? 88 : 110,
+                                    height: 11
+                                )
+
+                            RoundedRectangle(cornerRadius: 3)
+                                .fill(VeronicaTheme.strongerFill)
+                                .frame(
+                                    width: index == 1 ? 150 : 95,
+                                    height: 11
+                                )
+                        }
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+
+            GroupBox("Recently changed") {
+                VStack(spacing: 0) {
+                    ForEach(0..<3, id: \.self) { index in
+                        HStack(spacing: 12) {
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(VeronicaTheme.strongerFill)
+                                .frame(width: 22, height: 18)
+
+                            VStack(alignment: .leading, spacing: 6) {
+                                RoundedRectangle(cornerRadius: 3)
+                                    .fill(VeronicaTheme.strongerFill)
+                                    .frame(width: 220, height: 11)
+
+                                RoundedRectangle(cornerRadius: 3)
+                                    .fill(VeronicaTheme.strongerFill)
+                                    .frame(width: 150, height: 9)
+                            }
+
+                            Spacer()
+
+                            RoundedRectangle(cornerRadius: 3)
+                                .fill(VeronicaTheme.strongerFill)
+                                .frame(width: 80, height: 10)
+                        }
+                        .padding(.vertical, 8)
+
+                        if index < 2 {
+                            Divider()
+                        }
+                    }
+                }
+            }
+        }
+        .accessibilityHidden(true)
     }
 
     @ViewBuilder
@@ -250,6 +377,48 @@ struct MetricCard: View {
         .overlay {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .stroke(VeronicaTheme.border, lineWidth: 1)
+        }
+    }
+}
+
+
+private struct ColdStartMetricCard: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(VeronicaTheme.accent.opacity(0.35))
+                .frame(width: 28, height: 3)
+
+            RoundedRectangle(cornerRadius: 3)
+                .fill(VeronicaTheme.strongerFill)
+                .frame(width: 74, height: 10)
+
+            RoundedRectangle(cornerRadius: 4)
+                .fill(VeronicaTheme.strongerFill)
+                .frame(width: 82, height: 22)
+
+            RoundedRectangle(cornerRadius: 3)
+                .fill(VeronicaTheme.strongerFill)
+                .frame(width: 112, height: 9)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(18)
+        .background(
+            VeronicaTheme.subtleFill,
+            in: RoundedRectangle(
+                cornerRadius: 14,
+                style: .continuous
+            )
+        )
+        .overlay {
+            RoundedRectangle(
+                cornerRadius: 14,
+                style: .continuous
+            )
+            .stroke(
+                VeronicaTheme.border,
+                lineWidth: 1
+            )
         }
     }
 }

@@ -37,3 +37,6 @@ ui-screenshots/
 veronica-engine.spec
 macos/Veronica/Resources/VeronicaEngine/veronica-engine
 macos/Veronica/Resources/VeronicaEngine/preset-720P.json
+
+# Local UI review captures
+ui-review/

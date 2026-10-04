@@ -128,14 +128,12 @@ struct ContentView: View {
 
     var body: some View {
         Group {
-            if model.isLoading && model.snapshot == nil {
-                ProgressView("Starting Veronica…")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            } else if let snapshot = model.snapshot, !snapshot.configured {
+            if let snapshot = model.snapshot, !snapshot.configured {
                 SetupView()
-
             } else {
+                // Render the normal application shell immediately. Individual
+                // views may show lightweight loading states while the initial
+                // engine snapshot refreshes in the background.
                 mainInterface
             }
         }

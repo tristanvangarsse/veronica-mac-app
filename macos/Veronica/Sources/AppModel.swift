@@ -6,6 +6,12 @@ import SwiftUI
 final class AppModel: ObservableObject {
     @Published var snapshot: UISnapshot?
     @Published var isLoading = false
+
+    // A cached snapshot may be displayed immediately at launch, but only a
+    // snapshot fetched successfully during this app session is considered
+    // live enough to authorize maintenance.
+    @Published private(set) var hasLiveSnapshot = false
+
     @Published var isRunningAnnual = false
     @Published var errorMessage: String?
     @Published var activityLines: [String] = []
@@ -24,17 +30,102 @@ final class AppModel: ObservableObject {
     // later click.
     private var mediaProcessingSaveRequested = false
 
+    private let snapshotCacheURL: URL
+
+    init() {
+        let fm = FileManager.default
+        let appSupport = fm.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? fm.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support", isDirectory: true)
+
+        let directory = appSupport
+            .appendingPathComponent("Veronica", isDirectory: true)
+
+        snapshotCacheURL = directory
+            .appendingPathComponent("ui-snapshot-cache.json")
+
+        loadCachedSnapshot()
+    }
+
+    private func loadCachedSnapshot() {
+        do {
+            let data = try Data(contentsOf: snapshotCacheURL)
+            let cached = try JSONDecoder().decode(UISnapshot.self, from: data)
+
+            snapshot = cached
+            processImages = cached.mediaProcessing.images
+            processVideos = cached.mediaProcessing.videos
+            processAudio = cached.mediaProcessing.audio
+
+            DiagnosticsCenter.shared.log(
+                "INFO",
+                "App",
+                "Loaded cached UI snapshot"
+            )
+        } catch {
+            // A missing, outdated, or corrupt cache is equivalent to having no
+            // cache. The normal live refresh will populate state shortly.
+            snapshot = nil
+        }
+    }
+
+    private func cacheSnapshot(_ snapshot: UISnapshot) {
+        do {
+            let directory = snapshotCacheURL.deletingLastPathComponent()
+
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true
+            )
+
+            let encoder = JSONEncoder()
+            let data = try encoder.encode(snapshot)
+
+            try data.write(
+                to: snapshotCacheURL,
+                options: .atomic
+            )
+        } catch {
+            DiagnosticsCenter.shared.log(
+                "ERROR",
+                "App",
+                "Could not cache UI snapshot: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    @discardableResult
+    private func requireLiveSnapshot() -> Bool {
+        guard hasLiveSnapshot else {
+            errorMessage = "Veronica is still refreshing its live state. Wait a moment, then try again."
+            return false
+        }
+
+        return true
+    }
+
     func refresh() async {
         DiagnosticsCenter.shared.log("INFO", "App", "Refreshing UI snapshot")
         isLoading = true
-        defer { isLoading = false }
+        hasLiveSnapshot = false
+
+        defer {
+            isLoading = false
+        }
+
         do {
             let refreshed = try await EngineRunner.shared.snapshot()
+
             snapshot = refreshed
+            hasLiveSnapshot = true
 
             processImages = refreshed.mediaProcessing.images
             processVideos = refreshed.mediaProcessing.videos
             processAudio = refreshed.mediaProcessing.audio
+
+            cacheSnapshot(refreshed)
 
             let missing = refreshed.preflight.missingRequirements
             if missing.isEmpty {
@@ -44,7 +135,11 @@ final class AppModel: ObservableObject {
             }
         } catch {
             errorMessage = error.localizedDescription
-            DiagnosticsCenter.shared.log("ERROR", "App", "Snapshot refresh failed: \(error.localizedDescription)")
+            DiagnosticsCenter.shared.log(
+                "ERROR",
+                "App",
+                "Snapshot refresh failed: \(error.localizedDescription)"
+            )
         }
     }
 
@@ -53,6 +148,8 @@ final class AppModel: ObservableObject {
         videos: Bool? = nil,
         audio: Bool? = nil
     ) async {
+        guard requireLiveSnapshot() else { return }
+
         // Update the visible controls immediately.
         if let images {
             processImages = images
@@ -122,6 +219,8 @@ final class AppModel: ObservableObject {
         dateFormat: String? = nil,
         maxBytes: Int? = nil
     ) async {
+        guard requireLiveSnapshot() else { return }
+
         guard let current = snapshot?.filenamePolicy else { return }
 
         let nextEnabled = enabled ?? current.enabled
@@ -145,6 +244,8 @@ final class AppModel: ObservableObject {
         start: String? = nil,
         end: String? = nil
     ) async {
+        guard requireLiveSnapshot() else { return }
+
         do {
             try await EngineRunner.shared.configureDateScope(
                 mode: mode,
@@ -158,6 +259,8 @@ final class AppModel: ObservableObject {
     }
 
     func addScanFolders() async {
+        guard requireLiveSnapshot() else { return }
+
         let panel = NSOpenPanel()
         panel.title = "Add Folders"
         panel.message = "Choose one or more folders Veronica should scan."
@@ -185,6 +288,8 @@ final class AppModel: ObservableObject {
     }
 
     func removeScanFolder(_ path: String) async {
+        guard requireLiveSnapshot() else { return }
+
         do {
             try await EngineRunner.shared.removeScanFolder(path)
             await refresh()
@@ -194,7 +299,10 @@ final class AppModel: ObservableObject {
     }
 
     func runAnnual() async {
+        guard requireLiveSnapshot() else { return }
+
         guard !isRunningAnnual else { return }
+
         guard snapshot?.configured == true else {
             errorMessage = "Add at least one folder before running maintenance."
             return
@@ -258,6 +366,8 @@ final class AppModel: ObservableObject {
     }
 
     func keepAsIs(_ item: ReviewItem) async {
+        guard requireLiveSnapshot() else { return }
+
         guard let plan = item.planPath else {
             errorMessage = "This review item is missing its immutable plan path."
             return
@@ -283,6 +393,8 @@ final class AppModel: ObservableObject {
     }
 
     func processNormally(_ item: ReviewItem) async {
+        guard requireLiveSnapshot() else { return }
+
         guard item.canProcessNormally else {
             errorMessage = "This review issue cannot safely be bypassed."
             return
