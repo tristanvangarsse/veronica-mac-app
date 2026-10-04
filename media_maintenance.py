@@ -2246,7 +2246,32 @@ def verify_staged_output(src: Path, out: Path, item: dict[str, Any], cfg: dict[s
                 )
                 if not v["embedded_creation_time_preserved"]:
                     return "FAILED", v | {"error": "embedded_creation_time_changed"}
-                v["rotation_preserved"] = v["source_video"].get("rotation") == v["output_video"].get("rotation")
+                source_rotation = int(v["source_video"].get("rotation") or 0) % 360
+                output_rotation = int(v["output_video"].get("rotation") or 0) % 360
+
+                # HandBrake may normalize 90/270-degree display-matrix rotation
+                # into the encoded pixel geometry. For example, a source stored
+                # as 848x480 + rotation 270 may correctly become 480x848 +
+                # rotation 0. That is visual preservation, not a rotation loss.
+                #
+                # Keep exact metadata equality as the normal case. Accept baked
+                # 90/270-degree normalization only when the independently
+                # verified full-frame geometry and display aspect ratio agree.
+                rotation_metadata_equal = source_rotation == output_rotation
+                rotation_baked_into_pixels = (
+                    source_rotation in {90, 270}
+                    and output_rotation == 0
+                    and bool(v.get("full_frame_geometry_preserved"))
+                    and bool(v.get("display_aspect_ratio_preserved"))
+                )
+
+                v["rotation_metadata_equal"] = rotation_metadata_equal
+                v["rotation_baked_into_pixels"] = rotation_baked_into_pixels
+                v["rotation_preserved"] = (
+                    rotation_metadata_equal
+                    or rotation_baked_into_pixels
+                )
+
                 if not v["rotation_preserved"]:
                     return "FAILED", v | {"error": "rotation_changed"}
             else:
