@@ -181,7 +181,16 @@ struct ReviewItem: Codable, Identifiable {
         case planPath = "plan_path"
     }
     var canProcessNormally: Bool {
-        reason.contains("date_low_confidence") || reason.contains("date_conflict")
+        if reason.contains("date_low_confidence") || reason.contains("date_conflict") {
+            return true
+        }
+
+        let prefix = "video_source_review:apple_quicktime_metadata_streams:"
+        guard reason.hasPrefix(prefix) else { return false }
+
+        let countText = String(reason.dropFirst(prefix.count))
+        guard let count = Int(countText) else { return false }
+        return count > 0
     }
 
 
@@ -190,6 +199,7 @@ struct ReviewItem: Codable, Identifiable {
         if reason.contains("frame_count_mismatch") { return "Inconsistent frame count" }
         if reason.contains("date_low_confidence") { return "Date needs review" }
         if reason.contains("date_conflict") { return "Conflicting dates" }
+        if reason.contains("apple_quicktime_metadata_streams") { return "Apple camera metadata" }
         if reason.contains("legacy_v2_but_image_exceeds_current_target") { return "Previously processed large image" }
         if reason.contains("category_mismatch") { return "Media type does not match its folder" }
         if reason.contains("empty_file") { return "Empty file" }
@@ -205,6 +215,9 @@ struct ReviewItem: Codable, Identifiable {
         }
         if reason.contains("date_low_confidence") {
             return "The available date evidence is not strong enough for Veronica to make an automatic decision."
+        }
+        if reason.contains("apple_quicktime_metadata_streams") {
+            return "This QuickTime video contains Apple Core Media metadata tracks that are not preserved by Veronica's MP4 conversion. You can approve normal processing or keep the original unchanged."
         }
         if reason.contains("legacy_v2_but_image_exceeds_current_target") {
             return "This image was historically processed, but it is larger than today's dimensional target."

@@ -832,6 +832,55 @@ def historical_keep_original(con: sqlite3.Connection, asset_id: int, operation: 
     return row
 
 
+def review_reason_allows_process_normally(reason: Optional[str]) -> bool:
+    """Return True only for review reasons a human may explicitly approve.
+
+    Date uncertainty may be approved because later media-policy and source-risk
+    checks still run normally.
+
+    Apple QuickTime metadata streams may also be approved when they are the
+    *only* source-risk reason. HandBrake intentionally omits these auxiliary
+    Core Media metadata tracks from the MP4 output. Arbitrary data streams,
+    timing anomalies, HDR/Dolby, extra audio, chapters, and combined review
+    reasons remain non-bypassable.
+    """
+    text = str(reason or "")
+
+    if "date_low_confidence" in text or "date_conflict" in text:
+        return True
+
+    return re.fullmatch(
+        r"video_source_review:apple_quicktime_metadata_streams:[1-9][0-9]*",
+        text,
+    ) is not None
+
+
+def _filter_approved_video_review_reasons(
+    item: dict[str, Any],
+    review_reasons: list[str],
+) -> list[str]:
+    """Remove only the exact video source-risk reason explicitly approved.
+
+    Any additional/new source-risk reason remains and therefore blocks staging.
+    Source identity is independently checked before this function is reached.
+    """
+    target = item.get("target") or {}
+
+    if target.get("review_resolution") != "PROCESS_NORMALLY":
+        return review_reasons
+
+    original = str(target.get("review_original_reason") or "")
+    if not review_reason_allows_process_normally(original):
+        return review_reasons
+
+    prefix = "video_source_review:"
+    if not original.startswith(prefix):
+        return review_reasons
+
+    approved = original[len(prefix):]
+    return [reason for reason in review_reasons if reason != approved]
+
+
 def historical_review_resolution(
     con: sqlite3.Connection,
     asset_id: int,
@@ -870,6 +919,7 @@ def apply_historical_review_resolution(con: sqlite3.Connection, item: dict[str, 
     """Resolve an otherwise-REVIEW plan item when an exact guarded human decision exists."""
     if item.get("operation") != "REVIEW":
         return item
+
     resolved = historical_review_resolution(
         con,
         int(item["asset_id"]),
@@ -878,19 +928,56 @@ def apply_historical_review_resolution(con: sqlite3.Connection, item: dict[str, 
         int(item.get("source_size") or 0),
         resolution="KEEP_AS_IS",
     )
+    if resolved is not None:
+        target = dict(item.get("target") or {})
+        target.update({
+            "review_resolution": resolved["resolution"],
+            "review_resolved_at": resolved["decided_at"],
+            "review_original_reason": item.get("reason"),
+        })
+        item.update(
+            operation="SKIP_REVIEW_RESOLVED",
+            policy_version=None,
+            executable=False,
+            reason="sqlite_review_resolution_same_source_reason",
+            target=target,
+        )
+        return item
+
+    # Source-risk PROCESS_NORMALLY is deliberately much narrower than the
+    # general review mechanism. The only video source-risk currently eligible
+    # is an exact Apple Core Media metadata-stream review. The conversion policy
+    # and target were already frozen before source-risk classification, so
+    # restoring CONVERT_VIDEO does not invent or weaken any conversion policy.
+    reason = str(item.get("reason") or "")
+    if not reason.startswith("video_source_review:apple_quicktime_metadata_streams:"):
+        return item
+    if not review_reason_allows_process_normally(reason):
+        return item
+    if not item.get("policy_version"):
+        return item
+
+    resolved = historical_review_resolution(
+        con,
+        int(item["asset_id"]),
+        reason,
+        item.get("source_quick_hash"),
+        int(item.get("source_size") or 0),
+        resolution="PROCESS_NORMALLY",
+    )
     if resolved is None:
         return item
+
     target = dict(item.get("target") or {})
     target.update({
         "review_resolution": resolved["resolution"],
         "review_resolved_at": resolved["decided_at"],
-        "review_original_reason": item.get("reason"),
+        "review_original_reason": reason,
     })
     item.update(
-        operation="SKIP_REVIEW_RESOLVED",
-        policy_version=None,
-        executable=False,
-        reason="sqlite_review_resolution_same_source_reason",
+        operation="CONVERT_VIDEO",
+        executable=True,
+        reason="eligible_unprocessed_video",
         target=target,
     )
     return item
@@ -2232,8 +2319,64 @@ def verify_staged_output(src: Path, out: Path, item: dict[str, Any], cfg: dict[s
                         return "FAILED", v | {"error": "unexpected_crop_or_geometry_change"}
 
                 src_counts=stream_counts(sinfo); out_counts=stream_counts(oinfo)
-                v["stream_counts_preserved"] = all(out_counts.get(k,0)==src_counts.get(k,0) for k in ("video","audio","subtitle","data","attachment"))
-                if not v["stream_counts_preserved"]:
+
+                stream_counts_preserved = all(
+                    out_counts.get(k, 0) == src_counts.get(k, 0)
+                    for k in ("video", "audio", "subtitle", "data", "attachment")
+                )
+
+                approved_apple_metadata_drop = False
+                target = item.get("target") or {}
+                original_review_reason = str(
+                    target.get("review_original_reason") or ""
+                )
+                match = re.fullmatch(
+                    r"video_source_review:apple_quicktime_metadata_streams:([1-9][0-9]*)",
+                    original_review_reason,
+                )
+
+                if (
+                    target.get("review_resolution") == "PROCESS_NORMALLY"
+                    and match is not None
+                ):
+                    approved_count = int(match.group(1))
+                    source_data_streams = [
+                        stream
+                        for stream in (sinfo.get("streams", []) or [])
+                        if stream.get("codec_type") == "data"
+                    ]
+                    output_data_streams = [
+                        stream
+                        for stream in (oinfo.get("streams", []) or [])
+                        if stream.get("codec_type") == "data"
+                    ]
+
+                    source_data_are_exact_apple_metadata = (
+                        len(source_data_streams) == approved_count
+                        and all(
+                            str(stream.get("codec_tag_string") or "").lower() == "mebx"
+                            and str(
+                                (stream.get("tags") or {}).get("handler_name") or ""
+                            ) == "Core Media Metadata"
+                            for stream in source_data_streams
+                        )
+                    )
+
+                    non_data_counts_preserved = all(
+                        out_counts.get(k, 0) == src_counts.get(k, 0)
+                        for k in ("video", "audio", "subtitle", "attachment")
+                    )
+
+                    approved_apple_metadata_drop = (
+                        source_data_are_exact_apple_metadata
+                        and non_data_counts_preserved
+                        and len(output_data_streams) == 0
+                    )
+
+                v["stream_counts_preserved"] = stream_counts_preserved
+                v["approved_apple_metadata_stream_drop"] = approved_apple_metadata_drop
+
+                if not stream_counts_preserved and not approved_apple_metadata_drop:
                     return "FAILED", v | {"error": "stream_counts_changed"}
                 v["chapter_count_preserved"] = len(sinfo.get("chapters",[]) or []) == len(oinfo.get("chapters",[]) or [])
                 if not v["chapter_count_preserved"]:
@@ -2456,6 +2599,10 @@ def cmd_stage(args: argparse.Namespace) -> int:
                 if cfg.get("video_review_vfr", True) and source_summary.get("summary_rate_mismatch"):
                     frame_timing = video_frame_timing_summary(src)
                 review_reasons = video_source_review_reasons(source_probe, cfg, frame_timing)
+                review_reasons = _filter_approved_video_review_reasons(
+                    item,
+                    review_reasons,
+                )
             except Exception as exc:
                 rec["status"]="FAILED"; rec["error"]=f"source_video_probe_failed:{exc}"; results.append(rec)
                 print(f"[{idx}/{len(selected)}] FAILED          {item['relpath']} ({rec['error']})")
@@ -4837,9 +4984,9 @@ def cmd_resolve_review(args: argparse.Namespace) -> int:
 
     if args.resolution == "PROCESS_NORMALLY":
         reason = str(item.get("reason") or "")
-        if "date_low_confidence" not in reason and "date_conflict" not in reason:
+        if not review_reason_allows_process_normally(reason):
             raise SystemExit(
-                "PROCESS_NORMALLY is supported only for date-related review items. "
+                "PROCESS_NORMALLY is not permitted for this review reason. "
                 "This safety review cannot be bypassed."
             )
 

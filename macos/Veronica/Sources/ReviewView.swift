@@ -77,7 +77,7 @@ struct ReviewView: View {
                                     pendingProcess = item
                                 }
                                 .buttonStyle(.borderedProminent)
-                                .help("Approve this date review and let Veronica apply its normal policy.")
+                                .help("Approve this review and let Veronica apply its normal policy.")
                             }
 
                             Button("Keep As Is") {
@@ -142,7 +142,7 @@ struct ReviewView: View {
                 pendingProcess = nil
             }
         } message: {
-            Text("This approves the date-related review for this exact unchanged file. Veronica will still apply its normal conversion rules and all other safety checks. It does not force compression.")
+            Text("This approves this specific review reason for this exact unchanged file. Veronica will still apply its normal conversion rules and all other safety checks. It does not force compression.")
         }
     }
 
