@@ -133,4 +133,60 @@ with tempfile.TemporaryDirectory(prefix="veronica-media-processing-settings-") a
     assert enabled_video["reason"] == "date_low_confidence", enabled_video
     assert enabled_video["operation"] != "SKIP_MEDIA_TYPE_DISABLED"
 
+    # Non-media content is inventoried but is not Veronica maintenance work
+    # and must never become executable or user-facing Review noise.
+    document_row = {
+        "relpath": "example.docx",
+        "detected_kind": "unknown",
+        "tags": [],
+        "action": "REVIEW",
+        "reason": "unclassified_content:unknown",
+        "quick_hash": "document-hash",
+        "size": 4096,
+        "mtime_ts": 1,
+        "best_date": None,
+    }
+
+    document_item = mm.make_item(document_row, 100, cfg)
+    document_item = mm.apply_filename_policy(document_item, document_row, cfg)
+
+    assert document_item["operation"] == "SKIP_NONMEDIA", document_item
+    assert document_item["executable"] is False, document_item
+    assert document_item["reason"] == "unclassified_content:unknown", document_item
+    assert "final_relpath" not in document_item["target"], document_item
+
+    # Managed child-folder state must inherit the global media switches used
+    # by annual-all. This is the regression that caused Videos-only runs to
+    # behave as though Images and Audio were enabled.
+    parent_state = base / "ParentState"
+    child_media = base / "ManagedMedia"
+    child_media.mkdir()
+
+    parent_settings = {
+        "process_images": False,
+        "process_videos": True,
+        "process_audio": False,
+        "media_processing_settings_updated_at": "2026-10-04T00:00:00+00:00",
+        "scan_folders": [str(child_media)],
+    }
+    mm.save_product_settings(parent_state, parent_settings)
+
+    child_state = mm.prepare_scan_folder_state(parent_state, child_media)
+    child_settings = mm.load_product_settings(child_state)
+
+    assert child_settings["process_images"] is False, child_settings
+    assert child_settings["process_videos"] is True, child_settings
+    assert child_settings["process_audio"] is False, child_settings
+    assert (
+        child_settings["media_processing_settings_updated_at"]
+        == parent_settings["media_processing_settings_updated_at"]
+    ), child_settings
+
+    effective = mm.media_processing_product_settings(child_state)
+    assert effective == {
+        "images": False,
+        "videos": True,
+        "audio": False,
+    }, effective
+
 print("media processing settings regression: PASS")

@@ -390,6 +390,20 @@ def prepare_scan_folder_state(base_state_dir: Path, folder: Path) -> Path:
     child["date_scope_start"] = parent_scope.get("start")
     child["date_scope_end"] = parent_scope.get("end")
 
+    # Media-processing preferences are global product settings. Managed
+    # per-folder state must inherit them so annual-all cannot silently fall
+    # back to the default of processing every media type.
+    parent_media = media_processing_product_settings(base_state_dir)
+    child["process_images"] = parent_media["images"]
+    child["process_videos"] = parent_media["videos"]
+    child["process_audio"] = parent_media["audio"]
+
+    parent_saved = load_product_settings(base_state_dir)
+    if "media_processing_settings_updated_at" in parent_saved:
+        child["media_processing_settings_updated_at"] = (
+            parent_saved["media_processing_settings_updated_at"]
+        )
+
     child["managed_by_multi_folder"] = True
     child["parent_state_dir"] = str(base_state_dir)
     save_product_settings(folder_state, child)
@@ -1121,7 +1135,23 @@ def make_item(row: dict[str, Any], asset_id: int, cfg: dict[str, Any]) -> dict[s
         )
         return base
 
-    # Audit review decisions apply only to media types the user has enabled.
+    # Veronica is a media-maintenance tool. Ordinary files that are not
+    # detected as image, video, or audio remain inventoried for auditability,
+    # but they are not maintenance work and must not create Review noise.
+    #
+    # Explicit PRESERVE decisions above remain stronger, so protected files,
+    # symlinks, filesystem boundaries, and other safety cases are unchanged.
+    if kind not in media_enabled:
+        base.update(
+            operation="SKIP_NONMEDIA",
+            policy_version=None,
+            reason=row.get("reason") or f"nonmedia_content:{kind}",
+            target={"detected_kind": kind},
+            executable=False,
+        )
+        return base
+
+    # Audit review decisions apply only to enabled media.
     if row.get("action") == "REVIEW":
         base.update(operation="REVIEW", reason=row.get("reason") or "audit_review")
         return base
