@@ -2028,9 +2028,34 @@ def video_source_review_reasons(info: dict[str, Any], cfg: dict[str, Any], frame
             reasons.append(f"video_stream_count:{counts.get('video',0)}")
         if counts.get("audio", 0) > 1:
             reasons.append(f"multiple_audio_streams:{counts.get('audio',0)}")
-        for kind in ("subtitle", "data", "attachment"):
-            if counts.get(kind, 0):
-                reasons.append(f"extra_{kind}_streams:{counts.get(kind,0)}")
+
+        subtitle_count = counts.get("subtitle", 0)
+        if subtitle_count:
+            reasons.append(f"extra_subtitle_streams:{subtitle_count}")
+
+        data_streams = [
+            stream
+            for stream in (info.get("streams", []) or [])
+            if stream.get("codec_type") == "data"
+        ]
+        if data_streams:
+            apple_quicktime_metadata = all(
+                str(stream.get("codec_tag_string") or "").lower() == "mebx"
+                and str((stream.get("tags") or {}).get("handler_name") or "")
+                    == "Core Media Metadata"
+                for stream in data_streams
+            )
+            if apple_quicktime_metadata:
+                reasons.append(
+                    f"apple_quicktime_metadata_streams:{len(data_streams)}"
+                )
+            else:
+                reasons.append(f"extra_data_streams:{len(data_streams)}")
+
+        attachment_count = counts.get("attachment", 0)
+        if attachment_count:
+            reasons.append(f"extra_attachment_streams:{attachment_count}")
+
         if len(info.get("chapters", []) or []) > 0:
             # HandBrake may preserve chapters, but this must be explicitly verified before commit support.
             reasons.append(f"chapters_present:{len(info.get('chapters',[]) or [])}")
