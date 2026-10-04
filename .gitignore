@@ -35,8 +35,8 @@ ui-screenshots/
 
 # Veronica standalone engine build outputs
 veronica-engine.spec
-macos/Veronica/Resources/VeronicaEngine/veronica-engine
-macos/Veronica/Resources/VeronicaEngine/preset-720P.json
+macos/Veronica/Resources/VeronicaEngine/*
+!macos/Veronica/Resources/VeronicaEngine/README.txt
 
 # Local UI review captures
 ui-review/

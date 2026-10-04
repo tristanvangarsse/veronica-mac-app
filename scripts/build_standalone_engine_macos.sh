@@ -20,13 +20,20 @@ cd "$ROOT"
 "$BUILD/venv/bin/pyinstaller" \
   --clean \
   --noconfirm \
-  --onefile \
+  --onedir \
   --name veronica-engine \
   --paths "$ROOT" \
   --hidden-import PIL \
   veronica.py
 
-cp "$ROOT/dist/veronica-engine" "$OUT/veronica-engine"
+# Keep the tracked README, but replace all generated release-engine contents.
+find "$OUT" -mindepth 1 ! -name "README.txt" -exec rm -rf {} +
+
+cp -R "$ROOT/dist/veronica-engine/." "$OUT/"
 chmod 755 "$OUT/veronica-engine"
+
 cp "$ROOT/preset-720P.json" "$OUT/preset-720P.json"
+
 echo "Standalone Veronica engine staged at $OUT/veronica-engine"
+echo "Engine bundle size:"
+du -sh "$OUT"

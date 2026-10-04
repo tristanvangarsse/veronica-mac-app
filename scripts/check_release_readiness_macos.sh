@@ -11,6 +11,14 @@ external=0
 echo "=== Veronica standalone engine ==="
 if [[ -x "$ENGINE" ]]; then
   echo "OK bundled: $ENGINE"
+
+  echo "Smoke-testing bundled engine..."
+  if "$ENGINE" ui-snapshot >/dev/null; then
+    echo "OK engine smoke test: ui-snapshot"
+  else
+    echo "BROKEN bundled engine: ui-snapshot failed" >&2
+    fail=1
+  fi
 else
   echo "MISSING bundled engine: $ENGINE" >&2
   fail=1
