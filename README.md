@@ -138,6 +138,14 @@ Issues, bug reports, UI improvements, documentation fixes, and focused pull requ
 
 For visual changes, a before/after screenshot is helpful.
 
+## Support Veronica
+
+Veronica is free and open source.
+
+If Veronica saves you time or helps you take better care of your media library, you can support its development by buying me a coffee.
+
+☕ [Buy me a $5 coffee](https://buymeacoffee.com/tristanvangarsse)
+
 ## License
 
 See [LICENSE](LICENSE).
