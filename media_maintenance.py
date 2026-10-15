@@ -39,7 +39,7 @@ from typing import Any, Optional
 
 import media_audit as audit
 
-VERSION = "0.13.2"
+VERSION = "0.13.5"
 SCHEMA_VERSION = 9
 PRODUCT_NAME = "Veronica"
 DEFAULT_STATE_DIR = "~/Library/Application Support/Veronica"
@@ -72,6 +72,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "video_review_hdr": True,
     "video_review_extra_streams": True,
     "video_review_vfr": True,
+    "video_allow_camera_metadata_drop": True,
     "video_vfr_min_timing_intervals": 10,
     "video_vfr_cfr_like_max_outside_5_fraction": 0.01,
     "video_vfr_cfr_like_max_p95_p05_spread": 1.05,
@@ -256,14 +257,41 @@ def apply_product_date_scope_settings(
 
 
 
-def media_processing_product_settings(state_dir: Path) -> dict[str, bool]:
+def media_processing_product_settings(state_dir: Path) -> dict[str, Any]:
     """Return which media types Veronica is allowed to process."""
     saved = load_product_settings(state_dir)
+    image_exts = sorted(audit.IMAGE_EXTS)
+    video_exts = sorted(audit.VIDEO_EXTS)
+    audio_exts = sorted(audit.AUDIO_EXTS)
+
+    def enabled_extensions(key: str, all_exts: list[str], legacy_enabled: bool) -> list[str]:
+        raw = saved.get(key)
+        valid = set(all_exts)
+        if isinstance(raw, list):
+            values = []
+            for item in raw:
+                value = str(item).lower().strip()
+                if value and not value.startswith("."):
+                    value = "." + value
+                if value in valid and value not in values:
+                    values.append(value)
+            return sorted(values)
+        return all_exts if legacy_enabled else []
+
+    images = bool(saved.get("process_images", True))
+    videos = bool(saved.get("process_videos", True))
+    audio = bool(saved.get("process_audio", True))
+    image_enabled = enabled_extensions("process_image_extensions", image_exts, images)
+    video_enabled = enabled_extensions("process_video_extensions", video_exts, videos)
+    audio_enabled = enabled_extensions("process_audio_extensions", audio_exts, audio)
 
     return {
-        "images": bool(saved.get("process_images", True)),
-        "videos": bool(saved.get("process_videos", True)),
-        "audio": bool(saved.get("process_audio", True)),
+        "images": bool(image_enabled),
+        "videos": bool(video_enabled),
+        "audio": bool(audio_enabled),
+        "image_extensions": image_enabled,
+        "video_extensions": video_enabled,
+        "audio_extensions": audio_enabled,
     }
 
 
@@ -278,7 +306,103 @@ def apply_product_media_processing_settings(
     result["process_images"] = values["images"]
     result["process_videos"] = values["videos"]
     result["process_audio"] = values["audio"]
+    result["process_image_extensions"] = values["image_extensions"]
+    result["process_video_extensions"] = values["video_extensions"]
+    result["process_audio_extensions"] = values["audio_extensions"]
 
+    return result
+
+
+def optimization_product_settings(state_dir: Path) -> dict[str, Any]:
+    """Return validated user-facing optimization recipe settings."""
+    saved = load_product_settings(state_dir)
+
+    def int_setting(key: str, default: int, low: int, high: int) -> int:
+        try:
+            value = int(saved.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return min(max(value, low), high)
+
+    def float_setting(key: str, default: float, low: float, high: float) -> float:
+        try:
+            value = float(saved.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return min(max(value, low), high)
+
+    image_format = str(saved.get("image_output_format") or "jpeg").lower()
+    if image_format not in {"jpeg", "png"}:
+        image_format = "jpeg"
+
+    return {
+        "image_output_format": image_format,
+        "image_max_megapixels": float_setting(
+            "image_max_megapixels",
+            float(DEFAULT_CONFIG["streams_image_max_megapixels"]),
+            1.0,
+            60.0,
+        ),
+        "jpeg_quality": int_setting(
+            "jpeg_quality",
+            int(DEFAULT_CONFIG["streams_jpeg_quality"]),
+            30,
+            95,
+        ),
+        "video_max_edge": int_setting(
+            "video_max_edge",
+            int(DEFAULT_CONFIG["video_max_storage_edge"]),
+            480,
+            3840,
+        ),
+        "audio_min_size_mb": int_setting(
+            "audio_min_size_mb",
+            int(DEFAULT_CONFIG["audio_min_size_mb"]),
+            1,
+            500,
+        ),
+        "video_allow_camera_metadata_drop": bool(
+            saved.get(
+                "video_allow_camera_metadata_drop",
+                DEFAULT_CONFIG["video_allow_camera_metadata_drop"],
+            )
+        ),
+    }
+
+
+def apply_product_optimization_settings(
+    cfg: dict[str, Any],
+    state_dir: Path,
+) -> dict[str, Any]:
+    """Overlay persisted optimization recipe preferences onto engine config."""
+    result = json.loads(json.dumps(cfg))
+    values = optimization_product_settings(state_dir)
+
+    result["streams_image_max_megapixels"] = values["image_max_megapixels"]
+    result["photo_library_max_megapixels"] = values["image_max_megapixels"]
+    result["streams_jpeg_quality"] = values["jpeg_quality"]
+    result["photo_library_jpeg_quality"] = values["jpeg_quality"]
+    result["video_max_storage_edge"] = values["video_max_edge"]
+    result["audio_min_size_mb"] = values["audio_min_size_mb"]
+    result["image_output_format"] = values["image_output_format"]
+    result["video_allow_camera_metadata_drop"] = values[
+        "video_allow_camera_metadata_drop"
+    ]
+
+    return result
+
+
+def apply_product_settings(
+    cfg: dict[str, Any],
+    state_dir: Path,
+    run_date: Optional[dt.date] = None,
+) -> dict[str, Any]:
+    """Apply all native-app persisted preferences to an engine config."""
+    result = apply_product_filename_settings(cfg, state_dir)
+    result = apply_product_media_processing_settings(result, state_dir)
+    result = apply_product_optimization_settings(result, state_dir)
+    if run_date is not None:
+        result = apply_product_date_scope_settings(result, state_dir, run_date)
     return result
 
 def database_archive_root(state_dir: Path) -> Optional[Path]:
@@ -397,11 +521,31 @@ def prepare_scan_folder_state(base_state_dir: Path, folder: Path) -> Path:
     child["process_images"] = parent_media["images"]
     child["process_videos"] = parent_media["videos"]
     child["process_audio"] = parent_media["audio"]
+    child["process_image_extensions"] = parent_media["image_extensions"]
+    child["process_video_extensions"] = parent_media["video_extensions"]
+    child["process_audio_extensions"] = parent_media["audio_extensions"]
+
+    # Optimization recipe preferences are also global product settings. Folder
+    # plans are created from their isolated state directories, so copy the
+    # effective recipe into that state before analysis or annual maintenance.
+    parent_optimization = optimization_product_settings(base_state_dir)
+    child["image_output_format"] = parent_optimization["image_output_format"]
+    child["image_max_megapixels"] = parent_optimization["image_max_megapixels"]
+    child["jpeg_quality"] = parent_optimization["jpeg_quality"]
+    child["video_max_edge"] = parent_optimization["video_max_edge"]
+    child["audio_min_size_mb"] = parent_optimization["audio_min_size_mb"]
+    child["video_allow_camera_metadata_drop"] = parent_optimization[
+        "video_allow_camera_metadata_drop"
+    ]
 
     parent_saved = load_product_settings(base_state_dir)
     if "media_processing_settings_updated_at" in parent_saved:
         child["media_processing_settings_updated_at"] = (
             parent_saved["media_processing_settings_updated_at"]
+        )
+    if "optimization_settings_updated_at" in parent_saved:
+        child["optimization_settings_updated_at"] = (
+            parent_saved["optimization_settings_updated_at"]
         )
 
     child["managed_by_multi_folder"] = True
@@ -855,6 +999,27 @@ def review_reason_allows_process_normally(reason: Optional[str]) -> bool:
     ) is not None
 
 
+def is_date_only_review_reason(reason: Optional[str]) -> bool:
+    text = str(reason or "")
+    return (
+        "date_low_confidence" in text
+        or "date_conflict" in text
+        or "date_unknown" in text
+        or "no_eligibility_date" in text
+    )
+
+
+def should_auto_optimize_date_review(row: dict[str, Any], cfg: dict[str, Any]) -> bool:
+    """Date uncertainty may be bypassed only when date is not the scope filter."""
+    if row.get("action") != "REVIEW":
+        return False
+    if row.get("detected_kind") not in {"image", "video", "audio"}:
+        return False
+    if not is_date_only_review_reason(row.get("reason")):
+        return False
+    return (cfg.get("date_scope") or {}).get("mode") == "all"
+
+
 def _filter_approved_video_review_reasons(
     item: dict[str, Any],
     review_reasons: list[str],
@@ -1176,6 +1341,69 @@ def apply_filename_policy(
     return item
 
 
+def _filename_suffix_candidate(relpath: str, suffix_number: int) -> str:
+    path = Path(relpath)
+    return (path.parent / f"{path.stem}-{suffix_number}{path.suffix}").as_posix()
+
+
+def resolve_filename_collisions(
+    con: sqlite3.Connection,
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Assign deterministic suffixes for planned canonical filename conflicts."""
+    planned = [
+        item
+        for item in items
+        if str((item.get("target") or {}).get("final_relpath") or "")
+        and str((item.get("target") or {}).get("final_relpath") or "") != item.get("relpath")
+        and item.get("operation") != "REVIEW"
+    ]
+    if not planned:
+        return items
+
+    active_paths = {
+        str(row["relpath"])
+        for row in con.execute("SELECT relpath FROM assets WHERE active=1")
+    }
+    source_paths = {str(item.get("relpath")) for item in planned}
+    occupied_by_other_asset = active_paths - source_paths
+
+    used_destinations: set[str] = set()
+    for item in sorted(planned, key=lambda candidate: str(candidate.get("relpath"))):
+        original_final = str((item.get("target") or {}).get("final_relpath") or "")
+        chosen = original_final
+        suffix_number = 2
+
+        while chosen in used_destinations or chosen in occupied_by_other_asset:
+            chosen = _filename_suffix_candidate(original_final, suffix_number)
+            suffix_number += 1
+            if suffix_number > 1000:
+                target = dict(item.get("target") or {})
+                target["filename_collision"] = True
+                target["filename_collision_destination"] = original_final
+                item.update(
+                    operation="REVIEW",
+                    policy_version=None,
+                    executable=False,
+                    reason="filename_collision",
+                    target=target,
+                )
+                break
+
+        if item.get("operation") == "REVIEW":
+            continue
+
+        used_destinations.add(chosen)
+        if chosen != original_final:
+            target = dict(item.get("target") or {})
+            target["final_relpath"] = chosen
+            target["filename_disambiguated"] = True
+            target["filename_disambiguation_base"] = original_final
+            item["target"] = target
+
+    return items
+
+
 def make_item(row: dict[str, Any], asset_id: int, cfg: dict[str, Any]) -> dict[str, Any]:
     rel = Path(row["relpath"])
     root = rel.parts[0] if rel.parts else ""
@@ -1221,6 +1449,23 @@ def make_item(row: dict[str, Any], asset_id: int, cfg: dict[str, Any]) -> dict[s
             executable=False,
         )
         return base
+
+    if kind in media_enabled:
+        enabled_extensions = {
+            "image": set(cfg.get("process_image_extensions", sorted(audit.IMAGE_EXTS))),
+            "video": set(cfg.get("process_video_extensions", sorted(audit.VIDEO_EXTS))),
+            "audio": set(cfg.get("process_audio_extensions", sorted(audit.AUDIO_EXTS))),
+        }
+        ext = (row.get("extension") or "").lower()
+        if ext not in enabled_extensions[kind]:
+            base.update(
+                operation="SKIP_EXTENSION_DISABLED",
+                policy_version=None,
+                reason=f"{kind}_extension_disabled_by_user",
+                target={"media_type": kind, "extension": ext or "[none]"},
+                executable=False,
+            )
+            return base
 
     # Veronica is a media-maintenance tool. Ordinary files that are not
     # detected as image, video, or audio remain inventoried for auditability,
@@ -1292,7 +1537,10 @@ def make_item(row: dict[str, Any], asset_id: int, cfg: dict[str, Any]) -> dict[s
             base.update(operation="PRESERVE", reason="true_animated_image")
         else:
             ext = (row.get("extension") or "").lower()
-            fmt = "png" if ext == ".png" and row.get("has_alpha") else "jpeg"
+            requested_format = str(cfg.get("image_output_format") or "jpeg").lower()
+            fmt = "png" if requested_format == "png" else "jpeg"
+            if ext == ".png" and row.get("has_alpha"):
+                fmt = "png"
             policy_key = "photo_library_image" if is_photo_library else "streams_image"
             reason = (
                 "photo_library_image_above_target"
@@ -2126,13 +2374,16 @@ def video_source_review_reasons(info: dict[str, Any], cfg: dict[str, Any], frame
             if stream.get("codec_type") == "data"
         ]
         if data_streams:
-            apple_quicktime_metadata = all(
-                str(stream.get("codec_tag_string") or "").lower() == "mebx"
-                and str((stream.get("tags") or {}).get("handler_name") or "")
-                    == "Core Media Metadata"
-                for stream in data_streams
+            droppable_camera_metadata = (
+                bool(cfg.get("video_allow_camera_metadata_drop", True))
+                and all(is_droppable_camera_metadata_stream(stream) for stream in data_streams)
             )
-            if apple_quicktime_metadata:
+            if droppable_camera_metadata:
+                pass
+            elif all(
+                str(stream.get("codec_tag_string") or "").lower() == "mebx"
+                for stream in data_streams
+            ):
                 reasons.append(
                     f"apple_quicktime_metadata_streams:{len(data_streams)}"
                 )
@@ -2147,6 +2398,53 @@ def video_source_review_reasons(info: dict[str, Any], cfg: dict[str, Any], frame
             # HandBrake may preserve chapters, but this must be explicitly verified before commit support.
             reasons.append(f"chapters_present:{len(info.get('chapters',[]) or [])}")
     return sorted(set(reasons))
+
+
+def is_droppable_camera_metadata_stream(stream: dict[str, Any]) -> bool:
+    """Return True for auxiliary data tracks Veronica may omit.
+
+    These streams are neither audio, video, subtitles, nor attachments. They
+    commonly appear in phone/camera captures as timed metadata, sensor data, or
+    other auxiliary data and are not preserved by the MP4 optimization pipeline.
+    """
+    return stream.get("codec_type") == "data"
+
+
+def camera_metadata_drop_allowed(
+    source_info: dict[str, Any],
+    output_info: dict[str, Any],
+    cfg: dict[str, Any],
+) -> bool:
+    """Verify that conversion dropped only auxiliary camera metadata streams."""
+    if not bool(cfg.get("video_allow_camera_metadata_drop", True)):
+        return False
+
+    src_counts = stream_counts(source_info)
+    out_counts = stream_counts(output_info)
+
+    non_data_counts_preserved = all(
+        out_counts.get(k, 0) == src_counts.get(k, 0)
+        for k in ("video", "audio", "subtitle", "attachment")
+    )
+    if not non_data_counts_preserved:
+        return False
+
+    source_data_streams = [
+        stream
+        for stream in (source_info.get("streams", []) or [])
+        if stream.get("codec_type") == "data"
+    ]
+    output_data_streams = [
+        stream
+        for stream in (output_info.get("streams", []) or [])
+        if stream.get("codec_type") == "data"
+    ]
+
+    return (
+        bool(source_data_streams)
+        and not output_data_streams
+        and all(is_droppable_camera_metadata_stream(stream) for stream in source_data_streams)
+    )
 
 
 def video_stream_summary(info: dict[str, Any]) -> dict[str, Any]:
@@ -2325,7 +2623,7 @@ def verify_staged_output(src: Path, out: Path, item: dict[str, Any], cfg: dict[s
                     for k in ("video", "audio", "subtitle", "data", "attachment")
                 )
 
-                approved_apple_metadata_drop = False
+                approved_apple_metadata_drop = camera_metadata_drop_allowed(sinfo, oinfo, cfg)
                 target = item.get("target") or {}
                 original_review_reason = str(
                     target.get("review_original_reason") or ""
@@ -2367,7 +2665,7 @@ def verify_staged_output(src: Path, out: Path, item: dict[str, Any], cfg: dict[s
                         for k in ("video", "audio", "subtitle", "attachment")
                     )
 
-                    approved_apple_metadata_drop = (
+                    approved_apple_metadata_drop = approved_apple_metadata_drop or (
                         source_data_are_exact_apple_metadata
                         and non_data_counts_preserved
                         and len(output_data_streams) == 0
@@ -2535,6 +2833,7 @@ def cmd_stage(args: argparse.Namespace) -> int:
     db_path = state_dir / "media-maintenance.sqlite"
     if not db_path.exists(): raise SystemExit(f"State database not found: {db_path}")
     cfg = load_config(Path(args.config).expanduser() if args.config else None)
+    cfg = apply_product_settings(cfg, state_dir)
     package_dir = Path(__file__).resolve().parent
     # Ensure plan is the exact plan registered in DB.
     con = init_db(db_path, root); con.row_factory = sqlite3.Row
@@ -2789,6 +3088,7 @@ def commit_one(args: argparse.Namespace, quiet: bool = False) -> dict[str, Any]:
     plan = load_plan(plan_candidates[-1])
     root = Path(plan["root"]).resolve()
     cfg = load_config(Path(args.config).expanduser() if args.config else None)
+    cfg = apply_product_settings(cfg, state_dir)
     if root.stat().st_dev != state_dir.stat().st_dev:
         raise SystemExit("v0.4.0 requires Media and the state directory to be on the same filesystem for atomic quarantine/rollback")
     staged = choose_commit_candidate(report, args.relpath)
@@ -3015,6 +3315,7 @@ def commit_one_audio(args: argparse.Namespace, quiet: bool = False) -> dict[str,
     plan = load_plan(plan_candidates[-1])
     root = Path(plan["root"]).resolve()
     cfg = load_config(Path(args.config).expanduser() if args.config else None)
+    cfg = apply_product_settings(cfg, state_dir)
 
     if root.stat().st_dev != state_dir.stat().st_dev:
         raise SystemExit(
@@ -3447,6 +3748,7 @@ def commit_one_video(args: argparse.Namespace, quiet: bool = False) -> dict[str,
     plan = load_plan(plan_candidates[-1])
     root = Path(plan["root"]).resolve()
     cfg = load_config(Path(args.config).expanduser() if args.config else None)
+    cfg = apply_product_settings(cfg, state_dir)
     if root.stat().st_dev != state_dir.stat().st_dev:
         raise SystemExit("Video commit requires Media and the state directory on the same filesystem for atomic quarantine/rollback")
 
@@ -4415,10 +4717,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
     cfg = load_config(Path(args.config).expanduser() if args.config else None)
     state_dir = Path(args.state_dir).expanduser().resolve()
     state_dir.mkdir(parents=True, exist_ok=True)
-    cfg = apply_product_filename_settings(cfg, state_dir)
-    cfg = apply_product_media_processing_settings(cfg, state_dir)
     run_date = dt.date.fromisoformat(args.run_date) if args.run_date else dt.date.today()
-    cfg = apply_product_date_scope_settings(cfg, state_dir, run_date)
+    cfg = apply_product_settings(cfg, state_dir, run_date)
 
     auditor = audit.Auditor(root, cfg, run_date, state_dir, full_hashing=False, probe_media=True)
     cutoff_override = getattr(args, "cutoff_override", None)
@@ -4466,14 +4766,16 @@ def cmd_plan(args: argparse.Namespace) -> int:
         tags = set(row.get("tags", []))
         if "compressed-v1" in tags: legacy_v1 += 1
         if tags & set(cfg.get("legacy_v2_tags", [])): legacy_v2 += 1
+        # Date uncertainty should not block byte optimization when the user is
+        # maintaining all dates. It does, however, suppress automatic date-based
+        # filename standardization for that item.
+        auto_date_review = should_auto_optimize_date_review(row, cfg)
+
         # PROCESS_NORMALLY is deliberately narrow. It may override only the
         # auditor's date uncertainty for this exact source identity. It does not
         # bypass any later media-policy or source-risk review.
         process_normally = None
-        if row.get("action") == "REVIEW" and (
-            "date_low_confidence" in str(row.get("reason") or "")
-            or "date_conflict" in str(row.get("reason") or "")
-        ):
+        if row.get("action") == "REVIEW" and is_date_only_review_reason(row.get("reason")):
             process_normally = historical_review_resolution(
                 con,
                 asset_id,
@@ -4484,12 +4786,21 @@ def cmd_plan(args: argparse.Namespace) -> int:
             )
 
         policy_row = row
-        if process_normally is not None:
+        if process_normally is not None or auto_date_review:
             policy_row = dict(row)
             policy_row["action"] = "CANDIDATE"
 
         item = make_item(policy_row, asset_id, cfg)
-        item = apply_filename_policy(item, row, cfg)
+        filename_row = row
+        if auto_date_review and process_normally is None:
+            item["target"] = {
+                **item.get("target", {}),
+                "date_review_auto_optimized": True,
+                "suppressed_review_reason": row.get("reason"),
+            }
+            filename_row = dict(row)
+            filename_row["best_date"] = None
+        item = apply_filename_policy(item, filename_row, cfg)
 
         # A file already produced and committed by Veronica remains complete
         # when the active bytes still match the exact committed output.
@@ -4629,55 +4940,10 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
     # Plan ID is derived from the exact ordered decision payload, making it immutable/reproducible.
     items.sort(key=lambda x: x["relpath"])
-    # Detect canonical filename collisions before freezing the immutable plan.
-    #
-    # This catches:
-    # - two different source assets mapping to the same canonical destination;
-    # - a canonical destination already occupied by a different active asset.
-    #
-    # Collision handling is deliberately conservative: affected items become
-    # REVIEW and are never automatically renamed or overwritten.
-    planned_destinations: dict[str, list[dict[str, Any]]] = {}
-    for item in items:
-        final_relpath = str((item.get("target") or {}).get("final_relpath") or "")
-        if not final_relpath or final_relpath == item.get("relpath"):
-            continue
-        planned_destinations.setdefault(final_relpath, []).append(item)
-
-    canonical_collision_paths: set[str] = set()
-
-    # Multiple planned items converging on one destination.
-    for final_relpath, grouped in planned_destinations.items():
-        if len(grouped) > 1:
-            canonical_collision_paths.add(final_relpath)
-
-    # Destination already occupied by a different active archive asset.
-    for final_relpath, grouped in planned_destinations.items():
-        source_relpaths = {str(i.get("relpath")) for i in grouped}
-        occupied = con.execute(
-            "SELECT relpath FROM assets WHERE active=1 AND relpath=?",
-            (final_relpath,),
-        ).fetchone()
-        if occupied is not None and str(occupied["relpath"]) not in source_relpaths:
-            canonical_collision_paths.add(final_relpath)
-
-    if canonical_collision_paths:
-        for item in items:
-            final_relpath = str((item.get("target") or {}).get("final_relpath") or "")
-            if final_relpath not in canonical_collision_paths:
-                continue
-
-            target = dict(item.get("target") or {})
-            target["filename_collision"] = True
-            target["filename_collision_destination"] = final_relpath
-
-            item.update(
-                operation="REVIEW",
-                policy_version=None,
-                executable=False,
-                reason="filename_collision",
-                target=target,
-            )
+    # Resolve canonical filename collisions before freezing the immutable plan.
+    # Multiple planned items, or an occupied canonical destination, receive a
+    # deterministic suffix instead of becoming manual-review noise.
+    items = resolve_filename_collisions(con, items)
 
     plan_core = {
         "schema_version": 1,
@@ -5088,16 +5354,68 @@ def cmd_configure_media_types(args: argparse.Namespace) -> int:
         if value not in {"true", "false"}:
             raise SystemExit(f"--{name} must be true or false")
 
+    def parse_extensions(value: Optional[str], allowed: set[str], enabled: bool) -> list[str]:
+        if value is None:
+            return sorted(allowed) if enabled else []
+        result = []
+        for item in value.split(","):
+            ext = item.strip().lower()
+            if ext and not ext.startswith("."):
+                ext = "." + ext
+            if ext and ext not in allowed:
+                raise SystemExit(f"Unsupported media extension: {ext}")
+            if ext and ext not in result:
+                result.append(ext)
+        return sorted(result)
+
     current = load_product_settings(state_dir)
     current["process_images"] = args.images == "true"
     current["process_videos"] = args.videos == "true"
     current["process_audio"] = args.audio == "true"
+    current["process_image_extensions"] = parse_extensions(
+        args.image_extensions,
+        audit.IMAGE_EXTS,
+        current["process_images"],
+    )
+    current["process_video_extensions"] = parse_extensions(
+        args.video_extensions,
+        audit.VIDEO_EXTS,
+        current["process_videos"],
+    )
+    current["process_audio_extensions"] = parse_extensions(
+        args.audio_extensions,
+        audit.AUDIO_EXTS,
+        current["process_audio"],
+    )
     current["media_processing_settings_updated_at"] = now_iso()
 
     save_product_settings(state_dir, current)
 
     print(json.dumps(
         media_processing_product_settings(state_dir),
+        ensure_ascii=False,
+        sort_keys=True,
+    ))
+    return 0
+
+
+def cmd_configure_optimization(args: argparse.Namespace) -> int:
+    """Persist user-visible optimization recipe settings without modifying media."""
+    state_dir = Path(args.state_dir).expanduser().resolve()
+
+    current = load_product_settings(state_dir)
+    current["image_output_format"] = args.image_format
+    current["image_max_megapixels"] = float(args.image_max_megapixels)
+    current["jpeg_quality"] = int(args.jpeg_quality)
+    current["video_max_edge"] = int(args.video_max_edge)
+    current["audio_min_size_mb"] = int(args.audio_min_size_mb)
+    current["video_allow_camera_metadata_drop"] = args.allow_camera_metadata_drop == "true"
+    current["optimization_settings_updated_at"] = now_iso()
+
+    save_product_settings(state_dir, current)
+
+    print(json.dumps(
+        optimization_product_settings(state_dir),
         ensure_ascii=False,
         sort_keys=True,
     ))
@@ -5504,6 +5822,68 @@ def cmd_ui_snapshot(args: argparse.Namespace) -> int:
             "plan_path": aggregate_plan_path,
         }
 
+    # Read a bounded selection of planned work for the native UI.
+    # Never load thumbnails or media bytes in the Python engine.
+    optimization_previews = []
+    for folder in scan_folders:
+        if len(optimization_previews) >= 12:
+            break
+
+        folder_state_dir = scan_folder_state_dir(state_dir, folder)
+        folder_db = folder_state_dir / "media-maintenance.sqlite"
+        if not folder_db.is_file():
+            continue
+
+        connection = None
+        try:
+            connection = sqlite3.connect(
+                f"file:{folder_db}?mode=ro",
+                uri=True,
+            )
+            connection.row_factory = sqlite3.Row
+
+            latest = connection.execute(
+                "SELECT plan_id FROM plans ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            if latest is None:
+                continue
+
+            rows = connection.execute(
+                """
+                SELECT pi.relpath, pi.operation, pi.source_size
+                FROM plan_items pi
+                WHERE pi.plan_id = ?
+                  AND pi.executable = 1
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM commit_items ci
+                      WHERE ci.relpath = pi.relpath
+                        AND ci.status = 'COMMITTED'
+                  )
+                ORDER BY pi.seq
+                LIMIT ?
+                """,
+                (
+                    latest["plan_id"],
+                    12 - len(optimization_previews),
+                ),
+            ).fetchall()
+
+            for row in rows:
+                optimization_previews.append({
+                    "root": str(folder),
+                    "relpath": str(row["relpath"]),
+                    "operation": str(row["operation"]),
+                    "source_size": int(row["source_size"] or 0),
+                })
+        except sqlite3.Error:
+            # A missing or migrating plan should not prevent the dashboard
+            # from displaying its other read-only information.
+            pass
+        finally:
+            if connection is not None:
+                connection.close()
+
     legacy_root = configured_archive_root(state_dir)
 
     payload = {
@@ -5517,6 +5897,7 @@ def cmd_ui_snapshot(args: argparse.Namespace) -> int:
 
         # Compatibility only. Native UI uses scan_folders and per-item roots.
         "archive_root": str(legacy_root) if legacy_root else None,
+        "optimization_previews": optimization_previews,
 
         # Compatibility name; now means every configured scan folder is available.
         "archive_available": (
@@ -5542,6 +5923,7 @@ def cmd_ui_snapshot(args: argparse.Namespace) -> int:
         "recent_changes": recent_changes,
         "filename_policy": filename_product_settings(state_dir),
         "media_processing": media_processing_product_settings(state_dir),
+        "optimization_settings": optimization_product_settings(state_dir),
         "date_scope": date_scope_product_settings(state_dir, today),
         "preflight": dependency_status(),
     }
@@ -5666,6 +6048,44 @@ def _annual_calendar_cutoff(run_date: dt.date) -> dt.date:
     annual invocation does not affect eligibility.
     """
     return dt.date(run_date.year - 1, 1, 1)
+
+
+
+
+def cmd_analyze_all(args: argparse.Namespace) -> int:
+    """Create plans for configured folders without staging or committing media."""
+    base_state_dir = Path(args.state_dir).expanduser().resolve()
+    folders = configured_scan_folders(base_state_dir)
+
+    if not folders:
+        print("No scan folders are configured.", file=sys.stderr)
+        return 2
+
+    unavailable = [folder for folder in folders if not folder.is_dir()]
+    if unavailable:
+        print("Cannot analyze unavailable folders:", file=sys.stderr)
+        for folder in unavailable:
+            print(f"  {folder}", file=sys.stderr)
+        return 2
+
+    print(f"Analyzing {len(folders)} folder(s). Original media will not be changed.", flush=True)
+
+    for index, folder in enumerate(folders, 1):
+        print(f"ANALYZE_FOLDER {index}/{len(folders)} {folder}", flush=True)
+        folder_state = prepare_scan_folder_state(base_state_dir, folder)
+        plan_args = argparse.Namespace(
+            root=str(folder),
+            state_dir=str(folder_state),
+            config=args.config,
+            run_date=args.run_date,
+            cutoff_override=None,
+        )
+        result = cmd_plan(plan_args)
+        if result != 0:
+            return result
+
+    print("ANALYSIS_COMPLETE", flush=True)
+    return 0
 
 
 def cmd_annual_all(args: argparse.Namespace) -> int:
@@ -6119,6 +6539,13 @@ def main() -> int:
     pm.add_argument("--from-dir", default=LEGACY_STATE_DIR)
     pm.add_argument("--to-dir", default=DEFAULT_STATE_DIR)
     pm.add_argument("--apply", action="store_true", help="perform the atomic migration; default is dry-run")
+    panalyze = sub.add_parser(
+        "analyze-all",
+        help="scan configured folders and create plans without changing media",
+    )
+    panalyze.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
+    panalyze.add_argument("--config")
+    panalyze.add_argument("--run-date", help="YYYY-MM-DD; defaults to today")
     paa = sub.add_parser("annual-all", help="run annual maintenance across all configured scan folders using isolated per-folder state")
     paa.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
     paa.add_argument("--config")
@@ -6223,6 +6650,18 @@ def main() -> int:
     pmedia.add_argument("--images", choices=["true", "false"], required=True)
     pmedia.add_argument("--videos", choices=["true", "false"], required=True)
     pmedia.add_argument("--audio", choices=["true", "false"], required=True)
+    pmedia.add_argument("--image-extensions")
+    pmedia.add_argument("--video-extensions")
+    pmedia.add_argument("--audio-extensions")
+
+    popt = sub.add_parser("configure-optimization", help="store Veronica optimization recipe preferences")
+    popt.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
+    popt.add_argument("--image-format", choices=["jpeg", "png"], required=True)
+    popt.add_argument("--image-max-megapixels", type=float, required=True)
+    popt.add_argument("--jpeg-quality", type=int, choices=range(30, 96), metavar="[30-95]", required=True)
+    popt.add_argument("--video-max-edge", type=int, choices=range(480, 3841), metavar="[480-3840]", required=True)
+    popt.add_argument("--audio-min-size-mb", type=int, choices=range(1, 501), metavar="[1-500]", required=True)
+    popt.add_argument("--allow-camera-metadata-drop", choices=["true", "false"], default="true")
 
     pscope = sub.add_parser("configure-date-scope", help="store Veronica date-scope preferences")
     pscope.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
@@ -6268,6 +6707,7 @@ def main() -> int:
     args = p.parse_args()
     if args.cmd == "doctor": return cmd_doctor()
     if args.cmd == "migrate-state": return cmd_migrate_state(args)
+    if args.cmd == "analyze-all": return cmd_analyze_all(args)
     if args.cmd == "annual-all": return cmd_annual_all(args)
     if args.cmd == "annual": return cmd_annual(args)
     if args.cmd == "plan": return cmd_plan(args)
@@ -6283,6 +6723,7 @@ def main() -> int:
     if args.cmd == "resolve-review": return cmd_resolve_review(args)
     if args.cmd == "configure-filenames": return cmd_configure_filenames(args)
     if args.cmd == "configure-media-types": return cmd_configure_media_types(args)
+    if args.cmd == "configure-optimization": return cmd_configure_optimization(args)
     if args.cmd == "configure-date-scope": return cmd_configure_date_scope(args)
     if args.cmd == "configure-folders": return cmd_configure_folders(args)
     if args.cmd == "configure-library": return cmd_configure_library(args)

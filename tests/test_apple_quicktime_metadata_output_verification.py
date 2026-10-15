@@ -95,6 +95,7 @@ def main():
         cfg = dict(mm.DEFAULT_CONFIG)
         cfg["require_creation_date_before_commit"] = False
         cfg["stage_copy_personal_finder_tags"] = False
+        cfg["video_allow_camera_metadata_drop"] = False
 
         probes = [probe_source(), probe_output()]
 
@@ -134,6 +135,39 @@ def main():
             )
 
         assert status == "FAILED"
+        assert verification["error"] == "stream_counts_changed"
+
+        # The cleanup preference permits auxiliary metadata loss without an
+        # individual review approval, while preserving audio and video.
+        cfg["video_allow_camera_metadata_drop"] = True
+        probes = [probe_source(), probe_output()]
+
+        with patch.object(mm, "ffprobe_json", side_effect=probes), \
+             patch.object(mm, "filesystem_metadata", return_value={
+                 "mtime_ns": 0,
+                 "birth_ts": 0,
+             }), \
+             patch.object(mm, "read_finder_tags_safe", return_value=[]):
+            status, verification = mm.verify_staged_output(src, out, item, cfg)
+
+        assert status == "STAGED_VERIFIED", (status, verification)
+        assert verification["stream_counts_preserved"] is False
+        assert verification["approved_apple_metadata_stream_drop"] is True
+
+        # Enabling cleanup must not permit loss of an audio stream.
+        missing_audio = probe_output()
+        missing_audio["streams"] = [missing_audio["streams"][0]]
+        probes = [probe_source(), missing_audio]
+
+        with patch.object(mm, "ffprobe_json", side_effect=probes), \
+             patch.object(mm, "filesystem_metadata", return_value={
+                 "mtime_ns": 0,
+                 "birth_ts": 0,
+             }), \
+             patch.object(mm, "read_finder_tags_safe", return_value=[]):
+            status, verification = mm.verify_staged_output(src, out, item, cfg)
+
+        assert status == "FAILED", (status, verification)
         assert verification["error"] == "stream_counts_changed"
 
     print("Apple QuickTime metadata output verification regression: PASS")

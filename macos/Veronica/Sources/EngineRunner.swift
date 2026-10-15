@@ -51,7 +51,11 @@ final class EngineRunner {
     }
 
     private func standaloneEngineURL() -> URL? {
-#if DEBUG
+#if VERONICA_USE_SOURCE_ENGINE
+        // Development Release builds can opt into the bundled Python source.
+        // Production Release builds continue using the standalone executable.
+        return nil
+#elseif DEBUG
         // Development builds intentionally use the bundled Python source.
         //
         // The release engine is packaged separately and may have meaningful
@@ -119,6 +123,7 @@ final class EngineRunner {
            !stateDir.isEmpty,
            !effectiveArguments.contains("--state-dir") {
             let commandsWithStateDir: Set<String> = [
+                "analyze-all",
                 "annual-all",
                 "annual",
                 "ui-snapshot",
@@ -126,6 +131,7 @@ final class EngineRunner {
                 "configure-media-types",
                 "configure-date-scope",
                 "configure-filenames",
+                "configure-optimization",
                 "configure-library",
                 "preflight",
                 "status",
@@ -193,6 +199,17 @@ final class EngineRunner {
         }
     }
 
+    func analyzeAll(
+        onOutput: (@Sendable (String) -> Void)? = nil
+    ) async throws {
+        let result = try await run(["analyze-all"], onOutput: onOutput)
+        guard result.exitCode == 0 else {
+            throw EngineRunnerError.invalidOutput(
+                result.stderr.isEmpty ? result.stdout : result.stderr
+            )
+        }
+    }
+
     func snapshot() async throws -> UISnapshot {
         let result = try await run(["ui-snapshot"])
         guard result.exitCode == 0 else { throw EngineRunnerError.invalidOutput(result.stderr) }
@@ -226,13 +243,19 @@ final class EngineRunner {
     func configureMediaProcessing(
         images: Bool,
         videos: Bool,
-        audio: Bool
+        audio: Bool,
+        imageExtensions: [String],
+        videoExtensions: [String],
+        audioExtensions: [String]
     ) async throws {
         let result = try await run([
             "configure-media-types",
             "--images", images ? "true" : "false",
             "--videos", videos ? "true" : "false",
-            "--audio", audio ? "true" : "false"
+            "--audio", audio ? "true" : "false",
+            "--image-extensions", imageExtensions.joined(separator: ","),
+            "--video-extensions", videoExtensions.joined(separator: ","),
+            "--audio-extensions", audioExtensions.joined(separator: ",")
         ])
 
         guard result.exitCode == 0 else {
@@ -278,6 +301,30 @@ final class EngineRunner {
             "--enabled", enabled ? "true" : "false",
             "--date-format", dateFormat,
             "--max-bytes", String(maxBytes)
+        ])
+        guard result.exitCode == 0 else {
+            throw EngineRunnerError.invalidOutput(
+                result.stderr.isEmpty ? result.stdout : result.stderr
+            )
+        }
+    }
+
+    func configureOptimization(
+        imageFormat: String,
+        imageMaxMegapixels: Double,
+        jpegQuality: Int,
+        videoMaxEdge: Int,
+        audioMinSizeMB: Int,
+        videoAllowCameraMetadataDrop: Bool
+    ) async throws {
+        let result = try await run([
+            "configure-optimization",
+            "--image-format", imageFormat,
+            "--image-max-megapixels", String(imageMaxMegapixels),
+            "--jpeg-quality", String(jpegQuality),
+            "--video-max-edge", String(videoMaxEdge),
+            "--audio-min-size-mb", String(audioMinSizeMB),
+            "--allow-camera-metadata-drop", videoAllowCameraMetadataDrop ? "true" : "false"
         ])
         guard result.exitCode == 0 else {
             throw EngineRunnerError.invalidOutput(

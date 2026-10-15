@@ -4,6 +4,7 @@ import media_maintenance as mm
 
 
 cfg = dict(mm.DEFAULT_CONFIG)
+cfg["video_allow_camera_metadata_drop"] = False
 
 iphone_video = {
     "streams": [
@@ -49,6 +50,7 @@ reasons = mm.video_source_review_reasons(iphone_video, cfg)
 
 assert "apple_quicktime_metadata_streams:5" in reasons, reasons
 assert "extra_data_streams:5" not in reasons, reasons
+assert mm.video_source_review_reasons(iphone_video, mm.DEFAULT_CONFIG) == []
 
 unknown_data = {
     **iphone_video,

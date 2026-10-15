@@ -1,5 +1,9 @@
 import sqlite3
+import sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 import media_maintenance as mm
 
@@ -38,51 +42,13 @@ def apply_collision_logic(items, occupied_paths=()):
             (idx, relpath),
         )
 
-    planned_destinations = {}
-    for item in items:
-        final_relpath = str((item.get("target") or {}).get("final_relpath") or "")
-        if not final_relpath or final_relpath == item.get("relpath"):
-            continue
-        planned_destinations.setdefault(final_relpath, []).append(item)
-
-    canonical_collision_paths = set()
-
-    for final_relpath, grouped in planned_destinations.items():
-        if len(grouped) > 1:
-            canonical_collision_paths.add(final_relpath)
-
-    for final_relpath, grouped in planned_destinations.items():
-        source_relpaths = {str(i.get("relpath")) for i in grouped}
-        occupied = con.execute(
-            "SELECT relpath FROM assets WHERE active=1 AND relpath=?",
-            (final_relpath,),
-        ).fetchone()
-        if occupied is not None and str(occupied["relpath"]) not in source_relpaths:
-            canonical_collision_paths.add(final_relpath)
-
-    if canonical_collision_paths:
-        for item in items:
-            final_relpath = str((item.get("target") or {}).get("final_relpath") or "")
-            if final_relpath not in canonical_collision_paths:
-                continue
-
-            target = dict(item.get("target") or {})
-            target["filename_collision"] = True
-            target["filename_collision_destination"] = final_relpath
-
-            item.update(
-                operation="REVIEW",
-                policy_version=None,
-                executable=False,
-                reason="filename_collision",
-                target=target,
-            )
+    items = mm.resolve_filename_collisions(con, items)
 
     con.close()
     return items
 
 
-# 1. Two independent files converging on one destination must both review.
+# 1. Two independent files converging on one destination are disambiguated.
 items = [
     make_item(
         "Streams/Image/2023/foo.png",
@@ -96,12 +62,14 @@ items = [
 
 result = apply_collision_logic(items)
 
-assert all(i["operation"] == "REVIEW" for i in result), result
-assert all(i["reason"] == "filename_collision" for i in result), result
-assert all(i["executable"] is False for i in result), result
+assert all(i["operation"] == "RENAME" for i in result), result
+assert all(i["reason"] == "filename_not_canonical" for i in result), result
+assert all(i["executable"] is True for i in result), result
+assert result[0]["target"]["final_relpath"] == "Streams/Image/2023/2023-01-01_same-2.png", result
+assert result[1]["target"]["final_relpath"] == "Streams/Image/2023/2023-01-01_same.png", result
 
 
-# 2. Destination occupied by another active archive asset must review.
+# 2. Destination occupied by another active archive asset receives a suffix.
 items = [
     make_item(
         "Streams/Image/2023/foo.png",
@@ -114,9 +82,11 @@ result = apply_collision_logic(
     occupied_paths=["Streams/Image/2023/2023-01-01_foo.png"],
 )
 
-assert result[0]["operation"] == "REVIEW", result
-assert result[0]["reason"] == "filename_collision", result
-assert result[0]["executable"] is False, result
+assert result[0]["operation"] == "RENAME", result
+assert result[0]["reason"] == "filename_not_canonical", result
+assert result[0]["executable"] is True, result
+assert result[0]["target"]["final_relpath"] == "Streams/Image/2023/2023-01-01_foo-2.png", result
+assert result[0]["target"]["filename_disambiguated"] is True, result
 
 
 # 3. Unique, unoccupied canonical rename remains executable.
