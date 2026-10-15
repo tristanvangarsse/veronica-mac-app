@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 @main
@@ -8,13 +9,31 @@ struct VeronicaApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(model)
-                .frame(minWidth: 860, minHeight: 600)
+                .frame(
+                    width: VeronicaWindowMetrics.width,
+                    height: VeronicaWindowMetrics.height
+                )
+                .background(AppIconConfigurator())
                 .task {
                     DiagnosticsCenter.shared.log("INFO", "App", "Veronica launched")
+                    await model.prepareNotifications()
                     await model.refresh()
+#if DEBUG
+                    let arguments = ProcessInfo.processInfo.arguments
+                    if arguments.contains("--debug-run-analysis-on-launch") {
+                        await model.analyzeLibrary()
+                    }
+                    if arguments.contains("--debug-run-optimization-on-launch") {
+                        if !model.analysisCompleted {
+                            await model.analyzeLibrary()
+                        }
+                        await model.runAnnual()
+                    }
+#endif
                 }
         }
         .windowToolbarStyle(.unified)
+        .windowResizability(.contentSize)
         .commands {
             CommandGroup(after: .appInfo) {
                 Button("Refresh") { Task { await model.refresh() } }
@@ -29,4 +48,18 @@ struct VeronicaApp: App {
             }
         }
     }
+}
+
+private struct AppIconConfigurator: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async {
+            if let icon = NSImage(named: "VeronicaIcon") {
+                NSApp.applicationIconImage = icon
+            }
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }

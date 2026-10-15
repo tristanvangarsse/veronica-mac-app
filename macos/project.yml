@@ -13,8 +13,13 @@ targets:
     platform: macOS
     sources:
       - path: Veronica/Sources
+        excludes:
+          - "*.backup-*"
+      - path: Assets.xcassets
       - path: Veronica/Resources/Engine
         type: folder
+        buildPhase: resources
+      - path: Veronica/Resources/AppIcon.icns
         buildPhase: resources
       - path: Veronica/Resources/Runtime
         type: folder
@@ -25,15 +30,27 @@ targets:
       - path: Veronica/Resources/VeronicaEngine
         type: folder
         buildPhase: resources
+    info:
+      path: Veronica/Resources/Info.plist
+      properties:
+        CFBundleDevelopmentRegion: "$(DEVELOPMENT_LANGUAGE)"
+        CFBundleDisplayName: Veronica
+        CFBundleExecutable: "$(EXECUTABLE_NAME)"
+        CFBundleIconFile: AppIcon
+        CFBundleIdentifier: "$(PRODUCT_BUNDLE_IDENTIFIER)"
+        CFBundleInfoDictionaryVersion: "6.0"
+        CFBundleName: "$(PRODUCT_NAME)"
+        CFBundlePackageType: "$(PRODUCT_BUNDLE_PACKAGE_TYPE)"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        LSApplicationCategoryType: public.app-category.utilities
+        LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
+        NSHumanReadableCopyright: "Copyright © 2026 Tristan Van Garsse. All rights reserved."
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.tristan.veronica
         PRODUCT_NAME: Veronica
-        GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_CFBundleDisplayName: Veronica
-        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.utilities
-        INFOPLIST_KEY_NSHumanReadableCopyright: "Copyright © 2026 Tristan Van Garsse. All rights reserved."
         ENABLE_APP_SANDBOX: NO
         CODE_SIGN_STYLE: Automatic
-        CURRENT_PROJECT_VERSION: 1
-        MARKETING_VERSION: 0.13.2
+        CURRENT_PROJECT_VERSION: 3
+        MARKETING_VERSION: 0.13.5

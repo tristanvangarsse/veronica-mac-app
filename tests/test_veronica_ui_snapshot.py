@@ -5,11 +5,14 @@ import sys
 import tempfile
 from pathlib import Path
 
+PROJECT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT))
+
 import media_maintenance as mm
 
 
 def main() -> int:
-    project = Path(__file__).resolve().parents[1]
+    project = PROJECT
     script = project / "veronica.py"
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -25,7 +28,7 @@ def main() -> int:
         )
         assert proc.returncode == 0, proc.stdout + proc.stderr
         data = json.loads(proc.stdout)
-        assert data["version"] == "0.13.2"
+        assert data["version"] == "0.13.5"
         assert data["state_dir"] == str(state.resolve())
         assert data["active_assets"] == 0
         assert data["unresolved_reviews"] == []

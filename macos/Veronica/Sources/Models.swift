@@ -4,6 +4,114 @@ struct MediaProcessingPolicy: Codable {
     let images: Bool
     let videos: Bool
     let audio: Bool
+    let imageExtensions: [String]
+    let videoExtensions: [String]
+    let audioExtensions: [String]
+
+    static let allImageExtensions = [".bmp", ".gif", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".webp"]
+    static let allVideoExtensions = [".3gp", ".avi", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4", ".mts", ".webm"]
+    static let allAudioExtensions = [".aac", ".aif", ".aiff", ".amr", ".flac", ".m4a", ".m4r", ".mp3", ".ogg", ".opus", ".wav"]
+
+    enum CodingKeys: String, CodingKey {
+        case images
+        case videos
+        case audio
+        case imageExtensions = "image_extensions"
+        case videoExtensions = "video_extensions"
+        case audioExtensions = "audio_extensions"
+    }
+
+    init(
+        images: Bool,
+        videos: Bool,
+        audio: Bool,
+        imageExtensions: [String],
+        videoExtensions: [String],
+        audioExtensions: [String]
+    ) {
+        self.images = images
+        self.videos = videos
+        self.audio = audio
+        self.imageExtensions = imageExtensions
+        self.videoExtensions = videoExtensions
+        self.audioExtensions = audioExtensions
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let images = try container.decodeIfPresent(Bool.self, forKey: .images) ?? true
+        let videos = try container.decodeIfPresent(Bool.self, forKey: .videos) ?? true
+        let audio = try container.decodeIfPresent(Bool.self, forKey: .audio) ?? true
+
+        self.images = images
+        self.videos = videos
+        self.audio = audio
+        self.imageExtensions = try container.decodeIfPresent([String].self, forKey: .imageExtensions)
+            ?? (images ? Self.allImageExtensions : [])
+        self.videoExtensions = try container.decodeIfPresent([String].self, forKey: .videoExtensions)
+            ?? (videos ? Self.allVideoExtensions : [])
+        self.audioExtensions = try container.decodeIfPresent([String].self, forKey: .audioExtensions)
+            ?? (audio ? Self.allAudioExtensions : [])
+    }
+}
+
+struct OptimizationSettings: Codable {
+    let imageOutputFormat: String
+    let imageMaxMegapixels: Double
+    let jpegQuality: Int
+    let videoMaxEdge: Int
+    let audioMinSizeMB: Int
+    let videoAllowCameraMetadataDrop: Bool
+
+    static let recommended = OptimizationSettings(
+        imageOutputFormat: "jpeg",
+        imageMaxMegapixels: 10,
+        jpegQuality: 50,
+        videoMaxEdge: 1280,
+        audioMinSizeMB: 10,
+        videoAllowCameraMetadataDrop: true
+    )
+
+    enum CodingKeys: String, CodingKey {
+        case imageOutputFormat = "image_output_format"
+        case imageMaxMegapixels = "image_max_megapixels"
+        case jpegQuality = "jpeg_quality"
+        case videoMaxEdge = "video_max_edge"
+        case audioMinSizeMB = "audio_min_size_mb"
+        case videoAllowCameraMetadataDrop = "video_allow_camera_metadata_drop"
+    }
+}
+
+struct OptimizationPreview: Codable, Identifiable {
+    let root: String
+    let relpath: String
+    let operation: String
+    let sourceSize: Int64
+
+    var id: String { root + "|" + relpath }
+
+    var fileURL: URL {
+        URL(fileURLWithPath: root).appendingPathComponent(relpath)
+    }
+
+    var filename: String {
+        fileURL.lastPathComponent
+    }
+
+    var actionTitle: String {
+        switch operation {
+        case "CONVERT_IMAGE": return "Optimize image"
+        case "CONVERT_VIDEO": return "Optimize video"
+        case "CONVERT_AUDIO": return "Optimize audio"
+        case "RENAME": return "Standardize filename"
+        default: return "Planned change"
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case root, relpath, operation
+        case sourceSize = "source_size"
+    }
 }
 
 struct UISnapshot: Codable {
@@ -23,11 +131,13 @@ struct UISnapshot: Codable {
     let quarantineDirectories: Int
     let annual: AnnualScope
     let latestPlan: LatestPlan?
+    let optimizationPreviews: [OptimizationPreview]?
     let unresolvedReviews: [ReviewItem]
     let recentChanges: [RecentChange]
     let filenamePolicy: FilenamePolicySettings
     let dateScope: DateScopeSettings
     let mediaProcessing: MediaProcessingPolicy
+    let optimizationSettings: OptimizationSettings?
     let preflight: PreflightStatus
 
     enum CodingKeys: String, CodingKey {
@@ -44,11 +154,13 @@ struct UISnapshot: Codable {
         case totalSavingBytes = "total_saving_bytes"
         case quarantineDirectories = "quarantine_directories"
         case latestPlan = "latest_plan"
+        case optimizationPreviews = "optimization_previews"
         case unresolvedReviews = "unresolved_reviews"
         case recentChanges = "recent_changes"
         case filenamePolicy = "filename_policy"
         case dateScope = "date_scope"
         case mediaProcessing = "media_processing"
+        case optimizationSettings = "optimization_settings"
     }
 }
 
@@ -193,13 +305,63 @@ struct ReviewItem: Codable, Identifiable {
         return count > 0
     }
 
+    var category: String {
+        if reason.contains("dolby_vision") || reason.contains("hdr_transfer") || reason.contains("wide_gamut") {
+            return "Color quality"
+        }
+        if reason.contains("variable_frame_rate")
+            || reason.contains("frame_count_mismatch")
+            || reason.contains("non_monotonic_frame_timestamps")
+            || reason.contains("duplicate_frame_timestamps") {
+            return "Motion timing"
+        }
+        if reason.contains("multiple_audio_streams")
+            || reason.contains("multichannel_audio")
+            || reason.contains("extra_subtitle_streams")
+            || reason.contains("chapters_present")
+            || reason.contains("extra_attachment_streams")
+            || reason.contains("video_stream_count") {
+            return "Extra tracks"
+        }
+        if reason.contains("date_low_confidence")
+            || reason.contains("date_conflict")
+            || reason.contains("date_unknown")
+            || reason.contains("no_eligibility_date") {
+            return "Date evidence"
+        }
+        if reason.contains("legacy_v2_but_image_exceeds_current_target") {
+            return "Previous optimization"
+        }
+        return "Needs decision"
+    }
+
+    var recommendedAction: String {
+        if category == "Color quality" {
+            return "Keep the original unless you are comfortable losing HDR or Dolby Vision behavior."
+        }
+        if category == "Motion timing" {
+            return "Preview first. Keep the original if smooth playback matters."
+        }
+        if category == "Extra tracks" {
+            return "Keep the original if subtitles, chapters, surround audio, or alternate tracks matter."
+        }
+        if category == "Date evidence" {
+            return "Only needed when date-based organization or date ranges are active."
+        }
+        return "Preview the file, then choose whether Veronica should leave it unchanged."
+    }
 
     var title: String {
-        if reason.contains("variable_frame_rate") { return "Variable frame timing" }
-        if reason.contains("frame_count_mismatch") { return "Inconsistent frame count" }
+        if category == "Color quality" { return "HDR or Dolby Vision video" }
+        if reason.contains("variable_frame_rate") { return "Video timing may change" }
+        if reason.contains("frame_count_mismatch") { return "Video timing is inconsistent" }
         if reason.contains("date_low_confidence") { return "Date needs review" }
         if reason.contains("date_conflict") { return "Conflicting dates" }
-        if reason.contains("apple_quicktime_metadata_streams") { return "Apple camera metadata" }
+        if reason.contains("multiple_audio_streams") { return "Multiple audio tracks" }
+        if reason.contains("multichannel_audio") { return "Surround audio" }
+        if reason.contains("extra_subtitle_streams") { return "Subtitle tracks" }
+        if reason.contains("chapters_present") { return "Video chapters" }
+        if reason.contains("apple_quicktime_metadata_streams") { return "Camera metadata" }
         if reason.contains("legacy_v2_but_image_exceeds_current_target") { return "Previously processed large image" }
         if reason.contains("category_mismatch") { return "Media type does not match its folder" }
         if reason.contains("empty_file") { return "Empty file" }
@@ -207,14 +369,20 @@ struct ReviewItem: Codable, Identifiable {
     }
 
     var explanation: String {
+        if category == "Color quality" {
+            return "This video carries HDR, Dolby Vision, or wide-gamut color information. A standard optimization can change how it looks, so Veronica will not transcode it automatically."
+        }
         if reason.contains("variable_frame_rate") {
-            return "Frame timing varies enough that Veronica will not automatically transcode this video."
+            return "The video uses variable frame timing. Transcoding can alter motion smoothness or audio sync, even when duration checks pass."
         }
         if reason.contains("frame_count_mismatch") {
             return "The container's declared frame count does not agree with decoded frame timing, so automatic conversion is blocked."
         }
+        if category == "Extra tracks" {
+            return "This file contains extra streams such as alternate audio, subtitles, chapters, attachments, or surround channels. Veronica does not assume those can be discarded."
+        }
         if reason.contains("date_low_confidence") {
-            return "The available date evidence is not strong enough for Veronica to make an automatic decision."
+            return "The available date evidence is not strong enough for date-based organization."
         }
         if reason.contains("apple_quicktime_metadata_streams") {
             return "This QuickTime video contains Apple Core Media metadata tracks that are not preserved by Veronica's MP4 conversion. You can approve normal processing or keep the original unchanged."
