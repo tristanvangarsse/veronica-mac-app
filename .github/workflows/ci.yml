@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   engine-tests:
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -48,7 +48,7 @@ jobs:
           .build/audit-tools/bin/pip-audit --no-deps --disable-pip -r requirements/development.txt
 
   swift-build:
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:

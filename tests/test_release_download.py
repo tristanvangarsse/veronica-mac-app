@@ -15,6 +15,8 @@ with tempfile.TemporaryDirectory(prefix='veronica-dmg-test-') as td:
     subprocess.run(['/usr/bin/clang','-arch','arm64',str(source),'-o',str(macos/'Veronica')],check=True,capture_output=True)
     (app/'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier':'com.tristan.veronica.packagingcheck','CFBundleExecutable':'Veronica','CFBundlePackageType':'APPL','CFBundleShortVersionString':'0.16.0','CFBundleVersion':'7','LSMinimumSystemVersion':'26.0'}))
     subprocess.run(['/usr/bin/codesign','--force','--sign','-',str(app)],check=True,capture_output=True)
+    # Reproduce the private modes used by the standalone build environment.
+    (app/'Contents/Info.plist').chmod(0o600);macos.chmod(0o700)
     assets=base/'Downloads';dmg=package(app,assets,'v0.16.0-beta.1')
     data=json.loads((assets/'release.json').read_text())
     assert data['sha256']==hashlib.sha256(dmg.read_bytes()).hexdigest()
@@ -25,6 +27,8 @@ with tempfile.TemporaryDirectory(prefix='veronica-dmg-test-') as td:
         assert (mount/'Applications').is_symlink() and (mount/'Applications').readlink()==Path('/Applications')
         text=(mount/'Read me first.html').read_text();assert 'Privacy &amp; Security' in text and '0.16.0-beta.1' in text
         assert (mount/'Veronica licence.txt').is_file()
+        assert (mount/'Veronica.app/Contents/Info.plist').stat().st_mode&0o044==0o044
+        assert (mount/'Veronica.app/Contents/MacOS').stat().st_mode&0o055==0o055
         subprocess.run(['/usr/bin/codesign','--verify','--deep','--strict',str(mount/'Veronica.app')],check=True,capture_output=True)
     finally:subprocess.run(['/usr/bin/hdiutil','detach',str(mount)],check=True,capture_output=True)
     try:package(app,assets,'v0.16.0-beta.1')

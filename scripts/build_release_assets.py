@@ -29,6 +29,13 @@ def package(app, output, tag):
     with tempfile.TemporaryDirectory(prefix='veronica-dmg-') as td:
         stage=Path(td)
         subprocess.run(['/usr/bin/ditto',str(app),str(stage/'Veronica.app')],check=True)
+        # Build-time umask may be private. Shipped app resources must also be
+        # readable by a different standard user after a shared installation.
+        stage.chmod(0o755)
+        copied=stage/'Veronica.app'
+        for item in [copied,*copied.rglob('*')]:
+            if not item.is_symlink():item.chmod(0o755 if item.is_dir() or item.stat().st_mode&0o111 else 0o644)
+        subprocess.run(['/usr/bin/codesign','--verify','--deep','--strict',str(copied)],check=True)
         (stage/'Applications').symlink_to('/Applications')
         (stage/'Read me first.html').write_text('''<!doctype html><html lang="en"><meta charset="utf-8"><title>Welcome to Veronica</title>
 <style>body{margin:0;background:#f7f5fa;color:#241d2c;font:17px/1.6 -apple-system,BlinkMacSystemFont,sans-serif}main{max-width:680px;margin:48px auto;padding:40px;background:white;border-radius:24px}h1{font-size:42px;line-height:1.15;color:#813cb0}h2{margin-top:32px;font-size:23px}a{color:#68258d}.badge{display:inline-block;padding:6px 12px;border-radius:20px;background:#e4f6e6;color:#145c25}li{margin:12px 0}small{color:#63576f}</style>
