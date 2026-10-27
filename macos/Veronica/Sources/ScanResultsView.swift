@@ -204,7 +204,7 @@ struct ScanResultsView: View {
                             .disabled(recordingDecision || !model.hasLiveSnapshot || model.isSavingFileDate)
                             .accessibilityIdentifier("veronica.editFileDate")
                         } else {
-                            Text("Date editing is not available for this file format.")
+                            Text(item.dateEditingUnavailableReason)
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                         if let dateSavedMessage {

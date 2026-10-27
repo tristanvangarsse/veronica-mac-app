@@ -23,6 +23,12 @@ jobs:
           python -m venv .venv
           .venv/bin/python -m pip install --require-hashes -r requirements/development.txt
 
+      - name: Check dependency advisories
+        run: |
+          python -m venv .build/audit-tools
+          .build/audit-tools/bin/python -m pip install --require-hashes -r requirements/audit.txt
+          .build/audit-tools/bin/pip-audit --no-deps --disable-pip -r requirements/development.txt
+
       - name: Install media dependencies
         run: brew install ffmpeg handbrake exiftool
 
@@ -42,12 +48,6 @@ jobs:
 
       - name: Run source and release security regressions
         run: .venv/bin/python scripts/run_regressions.py
-
-      - name: Check dependency advisories
-        run: |
-          python -m venv .build/audit-tools
-          .build/audit-tools/bin/python -m pip install --require-hashes -r requirements/audit.txt
-          .build/audit-tools/bin/pip-audit --no-deps --disable-pip -r requirements/development.txt
 
   swift-build:
     runs-on: macos-26

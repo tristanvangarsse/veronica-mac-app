@@ -51,7 +51,7 @@ def package(app, output, tag):
     subprocess.run(['/usr/bin/hdiutil','verify',str(dmg)],check=True,capture_output=True,text=True)
     digest=hashlib.sha256(dmg.read_bytes()).hexdigest()
     (output/'SHA256SUMS.txt').write_text(digest+'  '+filename+'\n')
-    manifest={'version':version,'tag':tag,'minimum_macos':minimum,'architecture':'arm64','dmg':filename,'sha256':digest,'apple_notarized':False,'developer_id_signed':False}
+    manifest={'version':version,'tag':tag,'app_build':info['CFBundleVersion'],'minimum_macos':minimum,'architecture':'arm64','dmg':filename,'sha256':digest,'apple_notarized':False,'developer_id_signed':False}
     (output/'release.json').write_text(json.dumps(manifest,indent=2)+'\n')
     print(dmg)
     return dmg

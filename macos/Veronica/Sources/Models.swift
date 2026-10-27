@@ -278,6 +278,15 @@ struct ScanResultItem: Decodable, Identifiable {
         return original
     }
     var filename: String { fileURL.lastPathComponent }
+    var dateEditingUnavailableReason: String {
+        if reason == "excluded_directory" {
+            return "Date editing is disabled because this file is in a skipped subfolder."
+        }
+        if operation == "PRESERVE" {
+            return "Date editing is disabled to keep this protected file unchanged."
+        }
+        return "Date editing is not available for this file format."
+    }
     var actionTitle: String {
         guard category != "unchanged" else { return "Keep unchanged" }
         switch operation {

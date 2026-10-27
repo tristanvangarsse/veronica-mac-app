@@ -92,7 +92,14 @@ def collect(engine, output, cache):
     for request in contribs:results.append(fetch(request));print('Verified source: '+request['name'],flush=True)
     # Pillow bundles a FriBiDi shim; provide the version identified by its SBOM
     # as well as the dynamically linked media-tool version already collected.
-    fribidi={'name':'pillow-fribidi-1.0.16','url':'https://github.com/fribidi/fribidi/releases/download/v1.0.16/fribidi-1.0.16.tar.xz','sha256':None}
+    versions={component['version']
+              for sbom in (internal/'licenses/pillow').rglob('*.cdx.json')
+              for component in json.loads(sbom.read_text()).get('components',[])
+              if component.get('name','').casefold()=='fribidi'}
+    if len(versions)!=1 or not re.fullmatch(r'\d+\.\d+\.\d+',next(iter(versions))):
+        raise ValueError('Pillow SBOM must identify the exact FriBiDi source version')
+    fribidi_version=versions.pop()
+    fribidi={'name':'pillow-fribidi-'+fribidi_version,'url':f'https://github.com/fribidi/fribidi/releases/download/v{fribidi_version}/fribidi-{fribidi_version}.tar.xz','sha256':None}
     results.append(fetch(fribidi))
     shutil.copytree(internal/'MediaTools/licenses',output/'licences',dirs_exist_ok=True)
     shutil.copytree(internal/'licenses',output/'runtime-notices',dirs_exist_ok=True)

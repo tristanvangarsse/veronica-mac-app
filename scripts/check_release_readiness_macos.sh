@@ -26,5 +26,5 @@ if [[ "${VERONICA_PUBLIC_RELEASE:-0}" == 1 ]]; then
   /usr/sbin/spctl --assess --type execute --verbose=2 "$APP"
   echo "Public signing and notarization verification passed."
 else
-  echo "Local integrity checks passed. Public distribution still requires Developer ID signing, notarization and clean-Mac acceptance."
+  echo "Local integrity checks passed. Developer ID signing and notarization were not assessed. Complete fresh-account acceptance before sharing an unsigned beta."
 fi

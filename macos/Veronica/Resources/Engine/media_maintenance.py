@@ -6522,6 +6522,8 @@ def describe_scan_change(item: dict[str, Any], config: dict[str, Any]) -> str:
             explanation = "This audio file is below the folder’s size threshold."
         elif operation == "SKIP_NO_BENEFIT":
             explanation = "This file already meets the folder’s optimization targets."
+        elif reason == "excluded_directory":
+            explanation = "This file is in a subfolder you chose to skip in this folder’s settings."
         elif operation == "PRESERVE":
             explanation = "Veronica preserves this original to protect its content or format."
         else:
