@@ -47,7 +47,8 @@ import Foundation
     @MainActor static func main() async throws {
         let model = AppModel()
         await model.refresh()
-        precondition(model.hasLiveSnapshot && model.snapshot?.scanFolders.count == 2)
+        precondition(model.hasLiveSnapshot && model.snapshot?.scanFolders.count == 2,
+                     "Initial refresh failed: \\(model.errorMessage ?? \"no error\"); folders: \\(model.snapshot?.scanFolders.count ?? -1)")
 
         // Cancel before the subprocess has had time to start.
         let early = Task { await model.analyzeLibrary() }

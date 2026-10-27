@@ -19,7 +19,9 @@ jobs:
           python-version: '3.14.8'
 
       - name: Install Python dependencies
-        run: python -m pip install --require-hashes -r requirements/development.txt
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --require-hashes -r requirements/development.txt
 
       - name: Install media dependencies
         run: brew install ffmpeg handbrake exiftool
@@ -35,11 +37,11 @@ jobs:
 
       - name: Build and attest the frozen engine
         env:
-          PYTHON_BIN: python
+          PYTHON_BIN: .venv/bin/python
         run: bash scripts/build_standalone_engine_macos.sh
 
       - name: Run source and release security regressions
-        run: python scripts/run_regressions.py
+        run: .venv/bin/python scripts/run_regressions.py
 
       - name: Check dependency advisories
         run: |
