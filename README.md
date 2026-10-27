@@ -16,9 +16,10 @@ Veronica scans the folders you choose, plans maintenance before changing anythin
 
 ---
 
-<p align="center">
-  <img src="docs/screenshots/dashboard.png" width="900" alt="Veronica Dashboard"/>
-</p>
+**[Download Veronica for Mac — beta releases](https://github.com/tristanvangarsse/veronica-mac-app/releases)**
+Apple Silicon · macOS 26 or later · [Installation and first opening](docs/INSTALL.md)
+
+The beta includes its own tools and prepares them automatically on first launch. It is not Apple-notarized; read the installation guide before opening. Start with copies of test media while evaluating the beta.
 
 ## What is Veronica?
 
@@ -72,27 +73,11 @@ App-wide Settings contains reusable presets, the default preset for new folders,
 
 Folder names never choose a processing policy. Transparent PNGs, GIFs and protected source formats retain their safety rules. Skipped subfolder names start empty and are editable in each recipe. The former automatically filled list is cleared when loading an older recipe; custom exclusion lists are retained. Media folders cannot overlap one another or Veronica's data/recovery directory. Legacy explicit preferences migrate once; previous app defaults remain available as a preset. Media is not modified by setting changes.
 
-## Main sections
+## In the app
 
-### Dashboard
+Start with the compact folder screen. Add folders and choose settings for each one, then scan. The summary offers Review results and Smart cleanup. Review expands the window and shows each proposed change. App-wide settings are under **Veronica → Settings** in the menu bar.
 
-The Dashboard shows the current state of your media library, including indexed media, committed replacements, space saved, items requiring review, and the latest maintenance plan.
-
-### Activity
-
-Activity shows live progress during a run and a record of what happened during the most recent run.
-
-### Review
-
-Review contains files that require a human decision. You can inspect the file and decide whether to preserve it or allow Veronica to process it using its normal policy.
-
-### History
-
-History is the audit trail of media replacements Veronica has actually committed.
-
-### Settings
-
-Settings controls scan folders, date scope, filename policy, Veronica data, runtime readiness, media tools, and diagnostics.
+Dated change logs remain in Application Support and are available through Settings → Support. Temporary scan records are cleared on quit.
 
 ## Safety model
 
@@ -111,34 +96,21 @@ Files that cannot safely proceed through that process are preserved or sent for 
 
 ## Requirements
 
-Veronica is a native macOS application.
-
-Its maintenance engine also checks for the runtime and media tools it needs. Their availability is shown under **Settings → Runtime & media tools**.
+The current downloadable beta supports Apple Silicon Macs running macOS 26 or later. Its Python engine, photo/date components, media tools and required non-system libraries are included.
 
 ## Build from source
 
-Clone the repository:
+Build on macOS using Xcode, XcodeGen, Python 3.11+ and the versions in `requirements/development.txt`. The build environment also needs FFmpeg, HandBrakeCLI and ExifTool; end users do not install them separately.
 
-```bash
+```sh
 git clone https://github.com/tristanvangarsse/veronica-mac-app.git
 cd veronica-mac-app
+python3 -m venv .venv
+.venv/bin/python -m pip install --require-hashes -r requirements/development.txt
+bash scripts/build_local_app_macos.sh
 ```
 
-Open the Xcode project:
-
-```bash
-open macos/Veronica.xcodeproj
-```
-
-Or build from Terminal:
-
-```bash
-xcodebuild \
-  -project macos/Veronica.xcodeproj \
-  -scheme Veronica \
-  -configuration Debug \
-  build
-```
+The script prints an isolated, verified release path. Use that exact app with `scripts/build_release_assets.py` to make the versioned DMG. Source collection and release publication are separate steps so incomplete assets are not published.
 
 ## Contributing
 

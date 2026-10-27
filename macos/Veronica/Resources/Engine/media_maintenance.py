@@ -44,7 +44,7 @@ import media_audit as audit
 import media_security as security
 import media_change_log
 
-VERSION = "0.15.0"
+VERSION = "0.16.0"
 SCHEMA_VERSION = 9
 PRODUCT_NAME = "Veronica"
 DEFAULT_STATE_DIR = "~/Library/Application Support/Veronica"
