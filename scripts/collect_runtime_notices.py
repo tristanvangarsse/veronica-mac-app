@@ -6,6 +6,10 @@ import shutil
 import sys
 import sysconfig
 out=Path(sys.argv[1]);out.mkdir(parents=True,exist_ok=True)
+for package in ('pillow','pyinstaller','Python'):
+    previous=out/package
+    if previous.is_symlink():previous.unlink()
+    elif previous.exists():shutil.rmtree(previous)
 for package in ('pillow','pyinstaller'):
     distribution=importlib.metadata.distribution(package)
     for item in distribution.files or []:
