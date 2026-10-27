@@ -11,6 +11,7 @@ import tempfile
 from pathlib import Path
 
 from PIL import Image
+from fixture_dates import exif_date
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,6 +75,7 @@ with tempfile.TemporaryDirectory(prefix="veronica-lifecycle-") as td:
         image,
         format="JPEG",
         quality=95,
+        exif=exif_date("2023:01:15 12:00:00"),
     )
 
     video = media / "large-video.mp4"
@@ -102,6 +104,7 @@ with tempfile.TemporaryDirectory(prefix="veronica-lifecycle-") as td:
             "-c:a",
             "aac",
             "-shortest",
+            "-metadata", "creation_time=2023-01-15T12:00:00Z",
             str(video),
         ],
         cwd=ROOT,
@@ -125,6 +128,7 @@ with tempfile.TemporaryDirectory(prefix="veronica-lifecycle-") as td:
             "150",
             "-c:a",
             "pcm_s16le",
+            "-metadata", "date=2023-01-15",
             str(audio),
         ],
         cwd=ROOT,
@@ -170,30 +174,8 @@ with tempfile.TemporaryDirectory(prefix="veronica-lifecycle-") as td:
     review_data = json.loads(review_plan.read_text())
 
     assert len(review_data["items"]) == 3
-    assert all(
-        item["operation"] == "REVIEW"
-        for item in review_data["items"]
-    )
-
-    for name in (
-        "large-image.jpg",
-        "large-video.mp4",
-        "large-audio.wav",
-    ):
-        run(
-            "resolve-review",
-            "--state-dir",
-            str(state),
-            "--plan",
-            str(review_plan),
-            "--relpath",
-            name,
-            "--resolution",
-            "PROCESS_NORMALLY",
-            "--note",
-            "Automated lifecycle regression.",
-            "--yes",
-        )
+    assert all(item["operation"].startswith("CONVERT_") for item in review_data["items"])
+    assert all(item["target"]["filename_date"] == "2023-01-15" for item in review_data["items"])
 
     for path in (image, video, audio):
         assert sha256(path) == original_hashes[path.name]
@@ -308,9 +290,9 @@ with tempfile.TemporaryDirectory(prefix="veronica-lifecycle-") as td:
         "--yes",
     )
 
-    final_image = media / "2023-01-15_large-image.jpg"
-    final_video = media / "2023-01-15_large-video.mp4"
-    final_audio = media / "2023-01-15_large-audio.mp3"
+    final_image = media / "230115-large-image.jpg"
+    final_video = media / "230115-large-video.mp4"
+    final_audio = media / "230115-large-audio.mp3"
 
     assert final_image.is_file()
     assert final_video.is_file()

@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 
 from PIL import Image
+from fixture_dates import exif_date
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,8 +33,12 @@ with tempfile.TemporaryDirectory(prefix="veronica-annual-rename-") as tmp:
     folder = media / "Streams" / "Image" / "2023"
     folder.mkdir(parents=True)
 
+    import json
+    state.mkdir()
+    (state/'settings.json').write_text(json.dumps({"filename_date_format":"YYYY-MM-DD_"}))
+    policy=base/'policy.json';policy.write_text(json.dumps({"recompress_images_below_target":False}))
     source = folder / "230101-annual-rename.jpg"
-    Image.new("RGB", (100, 100), "white").save(source, "JPEG")
+    Image.new("RGB", (100, 100), "white").save(source, "JPEG", exif=exif_date())
 
     result = run([
         "annual",
@@ -41,6 +46,7 @@ with tempfile.TemporaryDirectory(prefix="veronica-annual-rename-") as tmp:
         "--state-dir", str(state),
         "--run-date", "2026-09-22",
         "--rename-batch", "25",
+        "--config", str(policy),
         "--yes",
     ])
 
@@ -49,7 +55,7 @@ with tempfile.TemporaryDirectory(prefix="veronica-annual-rename-") as tmp:
         print(result.stderr, file=sys.stderr)
         raise SystemExit(result.returncode)
 
-    final_path = folder / "2023-01-01_230101-annual-rename.jpg"
+    final_path = folder / "2023-01-01_annual-rename.jpg"
 
     assert not source.exists(), source
     assert final_path.is_file(), final_path
@@ -76,7 +82,7 @@ with tempfile.TemporaryDirectory(prefix="veronica-annual-rename-") as tmp:
     """).fetchone()
 
     assert asset is not None
-    assert asset[0] == "Streams/Image/2023/2023-01-01_230101-annual-rename.jpg", asset
+    assert asset[0] == "Streams/Image/2023/2023-01-01_annual-rename.jpg", asset
 
     con.close()
 

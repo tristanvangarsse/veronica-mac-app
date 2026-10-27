@@ -1,918 +1,217 @@
 import SwiftUI
 
+private struct PresetEditorSelection: Identifiable {
+    let id = UUID()
+    let preset: SettingsPreset?
+    let recipe: ProcessingRecipe
+    let suggestedName: String
+    var makeDefault = false
+}
+
 struct SettingsView: View {
-    @EnvironmentObject var model: AppModel
-    @State private var pendingRemoval: String?
-    @State private var jpegQualityDraft: Double?
-    @State private var imageOutputFormatDraft: String?
-    @State private var imageMegapixelsText = ""
-    @State private var videoMaxEdgeDraft: Int?
-    @State private var audioThresholdText = ""
-    @State private var videoMetadataCleanupDraft: Bool?
+    @EnvironmentObject private var model: AppModel
+    @State private var editorSelection: PresetEditorSelection?
+    @State private var pendingPresetRemoval: SettingsPreset?
+    @State private var errorMessage: String?
+    @State private var defaultSelection = ""
+    @State private var selectedTab = "defaults"
 
-    private static let dateFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter
-    }()
-
-    private func parsedDate(_ value: String?) -> Date {
-        if let value, let date = Self.dateFormatter.date(from: value) {
-            return date
-        }
-        return Date()
-    }
-
-    private func formattedDate(_ value: Date) -> String {
-        Self.dateFormatter.string(from: value)
-    }
-
-    private var shouldStartAtBottomForUICapture: Bool {
-        ProcessInfo.processInfo.arguments.contains("--ui-settings-bottom")
-    }
-
-    private func seedOptimizationDrafts(from settings: OptimizationSettings) {
-        if imageOutputFormatDraft == nil {
-            imageOutputFormatDraft = settings.imageOutputFormat
-        }
-
-        if imageMegapixelsText.isEmpty {
-            imageMegapixelsText = "\(Int(settings.imageMaxMegapixels.rounded()))"
-        }
-
-        if jpegQualityDraft == nil {
-            jpegQualityDraft = Double(settings.jpegQuality)
-        }
-
-        if videoMaxEdgeDraft == nil {
-            videoMaxEdgeDraft = settings.videoMaxEdge
-        }
-
-        if audioThresholdText.isEmpty {
-            audioThresholdText = "\(settings.audioMinSizeMB)"
-        }
-
-        if videoMetadataCleanupDraft == nil {
-            videoMetadataCleanupDraft = settings.videoAllowCameraMetadataDrop
-        }
-    }
-
-    private var recipeMatchesRecommended: Bool {
-        let recommended = OptimizationSettings.recommended
-        guard let settings = model.snapshot?.optimizationSettings else { return true }
-
-        return (imageOutputFormatDraft ?? settings.imageOutputFormat) == recommended.imageOutputFormat
-            && Int((jpegQualityDraft ?? Double(settings.jpegQuality)).rounded()) == recommended.jpegQuality
-            && (videoMaxEdgeDraft ?? settings.videoMaxEdge) == recommended.videoMaxEdge
-            && (Int(imageMegapixelsText) ?? -1) == Int(recommended.imageMaxMegapixels.rounded())
-            && (Int(audioThresholdText) ?? -1) == recommended.audioMinSizeMB
-            && (videoMetadataCleanupDraft ?? settings.videoAllowCameraMetadataDrop) == recommended.videoAllowCameraMetadataDrop
-    }
-
-    private func restoreRecommendedRecipe() {
-        let recommended = OptimizationSettings.recommended
-        imageOutputFormatDraft = recommended.imageOutputFormat
-        imageMegapixelsText = "\(Int(recommended.imageMaxMegapixels.rounded()))"
-        jpegQualityDraft = Double(recommended.jpegQuality)
-        videoMaxEdgeDraft = recommended.videoMaxEdge
-        audioThresholdText = "\(recommended.audioMinSizeMB)"
-        videoMetadataCleanupDraft = recommended.videoAllowCameraMetadataDrop
-
-        Task {
-            await model.restoreRecommendedOptimizationSettings()
-        }
-    }
+    private var presets: [SettingsPreset] { model.snapshot?.settingsPresets ?? [] }
+    private var defaultPreset: SettingsPreset? { presets.first { $0.id == model.snapshot?.defaultPresetID } }
+    private var busy: Bool { !model.hasLiveSnapshot || model.isAnalyzing || model.isRunningAnnual || model.isSavingSettings || model.isSavingFileDate }
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Settings").font(.largeTitle.bold())
-                    Text("Folders, Veronica data, runtime readiness, and diagnostics.").foregroundStyle(.secondary)
-                }
-
-                GroupBox("Folders to scan") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        if let snapshot = model.snapshot, !snapshot.scanFolders.isEmpty {
-                            ForEach(snapshot.scanFolders, id: \.self) { path in
-                                HStack(spacing: 12) {
-                                    Image(systemName: "folder")
-                                        .foregroundStyle(.secondary)
-
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text(path)
-                                            .lineLimit(1)
-                                            .truncationMode(.middle)
-                                            .textSelection(.enabled)
-
-                                        let unavailable = snapshot.unavailableScanFolders.contains(path)
-                                        Text(unavailable ? "Unavailable" : "Available")
-                                            .font(.caption)
-                                            .foregroundStyle(unavailable ? Color.red : Color.secondary)
-                                    }
-
-                                    Spacer()
-
-                                    Button {
-                                        pendingRemoval = path
-                                    } label: {
-                                        Image(systemName: "minus")
-                                    }
-                                    .help("Remove folder")
-                                    .disabled(model.isRunningAnnual)
-                                }
-
-                                if path != snapshot.scanFolders.last {
-                                    Divider()
-                                }
-                            }
-                        } else {
-                            Text("No folders added.")
-                                .foregroundStyle(.secondary)
-                        }
-
-                        HStack {
-                            Button {
-                                Task { await model.addScanFolders() }
-                            } label: {
-                                Label("Add Folders…", systemImage: "plus")
-                            }
-                            .disabled(model.isRunningAnnual)
-
-                            Spacer()
-                        }
-
-                        Text("Veronica scans only the folders listed here. You can add as many folders as you need. Removing a folder does not delete its media.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.vertical, 4)
-                }
-                GroupBox("Media to process") {
-                    if model.snapshot?.mediaProcessing != nil {
-                        VStack(alignment: .leading, spacing: 16) {
-                            Text("Choose exactly which file extensions Veronica may optimize. Disabled extensions are still inventoried, but Veronica will not change them.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-
-                            MediaExtensionGroup(
-                                title: "Images",
-                                extensions: MediaProcessingPolicy.allImageExtensions,
-                                enabled: model.imageExtensions
-                            ) { next in
-                                Task {
-                                    await model.updateMediaProcessing(imageExtensions: next)
-                                }
-                            }
-
-                            MediaExtensionGroup(
-                                title: "Videos",
-                                extensions: MediaProcessingPolicy.allVideoExtensions,
-                                enabled: model.videoExtensions
-                            ) { next in
-                                Task {
-                                    await model.updateMediaProcessing(videoExtensions: next)
-                                }
-                            }
-
-                            MediaExtensionGroup(
-                                title: "Audio",
-                                extensions: MediaProcessingPolicy.allAudioExtensions,
-                                enabled: model.audioExtensions
-                            ) { next in
-                                Task {
-                                    await model.updateMediaProcessing(audioExtensions: next)
-                                }
-                            }
-
-                            Label(
-                                "Turning off every extension in a category disables that category.",
-                                systemImage: "info.circle"
-                            )
-                            .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        .padding(.vertical, 4)
-                        .disabled(model.isRunningAnnual)
-                    }
-                }
-
-                GroupBox("Optimization recipe") {
-                    if let settings = model.snapshot?.optimizationSettings {
-                        let imageOutputFormat = imageOutputFormatDraft ?? settings.imageOutputFormat
-                        let jpegQuality = jpegQualityDraft ?? Double(settings.jpegQuality)
-                        let videoMaxEdge = videoMaxEdgeDraft ?? settings.videoMaxEdge
-                        let videoMetadataCleanup = videoMetadataCleanupDraft ?? settings.videoAllowCameraMetadataDrop
-
-                        VStack(alignment: .leading, spacing: 16) {
-                            HStack(alignment: .firstTextBaseline, spacing: 16) {
-                                Text("Choose how Veronica creates smaller files. Changes apply to the next analysis and never rewrite existing committed history.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-
-                                Spacer()
-
-                                Button("Restore Recommended Recipe") {
-                                    restoreRecommendedRecipe()
-                                }
-                                .disabled(model.isRunningAnnual || recipeMatchesRecommended)
-                            }
-
-                            LabeledContent("Image export") {
-                                Picker(
-                                    "Image export",
-                                    selection: Binding(
-                                        get: { imageOutputFormat },
-                                        set: { value in
-                                            imageOutputFormatDraft = value
-                                            Task {
-                                                await model.updateOptimizationSettings(
-                                                    imageFormat: value
-                                                )
-                                            }
-                                        }
-                                    )
-                                ) {
-                                    Text("JPEG").tag("jpeg")
-                                    Text("PNG").tag("png")
-                                }
-                                .pickerStyle(.segmented)
-                                .frame(width: 190)
-                            }
-
-                            Text("JPEG is the default for smaller photo-style images. PNG is preserved automatically for images with transparency.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-
-                            LabeledContent("Image size target") {
-                                SettingsNumericField(
-                                    text: $imageMegapixelsText,
-                                    range: 1...60,
-                                    suffix: "MP max"
-                                ) { value in
-                                    imageMegapixelsText = "\(value)"
-                                    Task {
-                                        await model.updateOptimizationSettings(
-                                            imageMaxMegapixels: Double(value)
-                                        )
-                                    }
-                                }
-                            }
-
-                            LabeledContent("JPEG quality") {
-                                HStack(spacing: 12) {
-                                    Slider(
-                                        value: Binding(
-                                            get: { jpegQuality },
-                                            set: { value in
-                                                jpegQualityDraft = value
-                                            }
-                                        ),
-                                        in: 30...95,
-                                        step: 1,
-                                        onEditingChanged: { editing in
-                                            guard !editing else { return }
-                                            let nextValue = Int((jpegQualityDraft ?? Double(settings.jpegQuality)).rounded())
-                                            jpegQualityDraft = Double(nextValue)
-                                            guard nextValue != settings.jpegQuality else { return }
-
-                                            Task {
-                                                await model.updateOptimizationSettings(
-                                                    jpegQuality: nextValue
-                                                )
-                                            }
-                                        }
-                                    )
-                                    .frame(width: 190)
-
-                                    Text("\(Int(jpegQuality.rounded()))")
-                                        .monospacedDigit()
-                                        .frame(width: 44, alignment: .trailing)
-                                }
-                            }
-
-                            LabeledContent("Video size target") {
-                                Picker(
-                                    "Video size target",
-                                    selection: Binding(
-                                        get: { videoMaxEdge },
-                                        set: { value in
-                                            videoMaxEdgeDraft = value
-                                            Task {
-                                                await model.updateOptimizationSettings(
-                                                    videoMaxEdge: value
-                                                )
-                                            }
-                                        }
-                                    )
-                                ) {
-                                    Text("720p").tag(1280)
-                                    Text("1080p").tag(1920)
-                                    Text("4K").tag(3840)
-                                }
-                                .pickerStyle(.segmented)
-                                .frame(width: 280)
-                            }
-
-                            Toggle(
-                                "Streamline auxiliary video metadata cleanup",
-                                isOn: Binding(
-                                    get: { videoMetadataCleanup },
-                                    set: { value in
-                                        videoMetadataCleanupDraft = value
-                                        Task {
-                                            await model.updateOptimizationSettings(
-                                                videoAllowCameraMetadataDrop: value
-                                            )
-                                        }
-                                    }
-                                )
-                            )
-
-                            Text("When enabled, Veronica may drop auxiliary data tracks during video optimization while preserving video, audio, subtitles, attachments, chapters, timing, color, and geometry checks.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-
-                            LabeledContent("Audio threshold") {
-                                SettingsNumericField(
-                                    text: $audioThresholdText,
-                                    range: 1...500,
-                                    suffix: "MB",
-                                    prefix: "over"
-                                ) { value in
-                                    audioThresholdText = "\(value)"
-                                    Task {
-                                        await model.updateOptimizationSettings(
-                                            audioMinSizeMB: value
-                                        )
-                                    }
-                                }
-                            }
-
-                            Label(
-                                "After changing the recipe, run Analyze Library again to preview the new plan.",
-                                systemImage: "arrow.clockwise"
-                            )
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        }
-                        .padding(.vertical, 4)
-                        .disabled(model.isRunningAnnual)
-                        .onAppear {
-                            seedOptimizationDrafts(from: settings)
-                        }
-                    }
-                }
-
-                GroupBox("Date scope") {
-                    if let scope = model.snapshot?.dateScope {
-                        VStack(alignment: .leading, spacing: 14) {
-                            Picker(
-                                "Apply maintenance to",
-                                selection: Binding(
-                                    get: { scope.mode },
-                                    set: { mode in
-                                        if mode == "all" {
-                                            Task {
-                                                await model.updateDateScope(mode: "all")
-                                            }
-                                        } else {
-                                            let start = scope.start ?? formattedDate(Date())
-                                            let end = scope.end ?? formattedDate(Date())
-                                            Task {
-                                                await model.updateDateScope(
-                                                    mode: mode,
-                                                    start: start,
-                                                    end: end
-                                                )
-                                            }
-                                        }
-                                    }
-                                )
-                            ) {
-                                Text("All dates")
-                                    .tag("all")
-                                Text("Only within range")
-                                    .tag("within")
-                                Text("Outside range")
-                                    .tag("outside")
-                            }
-                            .pickerStyle(.segmented)
-                            .frame(maxWidth: 560)
-
-                            if scope.mode == "within" || scope.mode == "outside" {
-                                VStack(alignment: .leading, spacing: 10) {
-                                    HStack(spacing: 14) {
-                                        Text("From")
-                                            .frame(width: 74, alignment: .leading)
-
-                                        DatePicker(
-                                            "",
-                                            selection: Binding(
-                                                get: { parsedDate(scope.start) },
-                                                set: { date in
-                                                    Task {
-                                                        await model.updateDateScope(
-                                                            mode: scope.mode,
-                                                            start: formattedDate(date),
-                                                            end: scope.end ?? formattedDate(date)
-                                                        )
-                                                    }
-                                                }
-                                            ),
-                                            displayedComponents: .date
-                                        )
-                                        .labelsHidden()
-                                        .datePickerStyle(.field)
-                                        .fixedSize()
-                                        .frame(minWidth: 210, alignment: .leading)
-                                    }
-
-                                    HStack(spacing: 14) {
-                                        Text("Through")
-                                            .frame(width: 74, alignment: .leading)
-
-                                        DatePicker(
-                                            "",
-                                            selection: Binding(
-                                                get: { parsedDate(scope.end) },
-                                                set: { date in
-                                                    Task {
-                                                        await model.updateDateScope(
-                                                            mode: scope.mode,
-                                                            start: scope.start ?? formattedDate(date),
-                                                            end: formattedDate(date)
-                                                        )
-                                                    }
-                                                }
-                                            ),
-                                            displayedComponents: .date
-                                        )
-                                        .labelsHidden()
-                                        .datePickerStyle(.field)
-                                        .fixedSize()
-                                        .frame(minWidth: 210, alignment: .leading)
-                                    }
-                                }
-                            }
-
-                            Text(scope.summary)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-
-                            if scope.mode == "all" {
-                                Text("Date filtering is disabled. Any otherwise eligible media date may be processed.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            } else if scope.mode == "within" {
-                                Text("Only media whose resolved date falls within this inclusive range is eligible.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            } else {
-                                Text("Only media whose resolved date falls before or after this inclusive range is eligible.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        .padding(.vertical, 4)
-                        .disabled(model.isRunningAnnual)
-                    }
-                }
-
-                GroupBox("File naming") {
-                    if let naming = model.snapshot?.filenamePolicy {
-                        VStack(alignment: .leading, spacing: 14) {
-                            Toggle(
-                                "Standardize media filenames",
-                                isOn: Binding(
-                                    get: { naming.enabled },
-                                    set: { value in
-                                        Task {
-                                            await model.updateFilenamePolicy(enabled: value)
-                                        }
-                                    }
-                                )
-                            )
-
-                            Text("When enabled, eligible media is named using its resolved Veronica date followed by the existing filename.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-
-                            Divider()
-
-                            LabeledContent("Format") {
-                                Picker(
-                                    "Format",
-                                    selection: Binding(
-                                        get: { naming.dateFormat },
-                                        set: { value in
-                                            Task {
-                                                await model.updateFilenamePolicy(dateFormat: value)
-                                            }
-                                        }
-                                    )
-                                ) {
-                                    Text("YYYY-MM-DD_filename.ext")
-                                        .tag("YYYY-MM-DD_")
-                                }
-                                .labelsHidden()
-                                .frame(width: 280)
-                            }
-
-                            LabeledContent("Maximum filename size") {
-                                SettingsNumberStepper(
-                                    value: naming.maxBytes,
-                                    range: 32...255,
-                                    suffix: "UTF-8 bytes"
-                                ) { value in
-                                    Task {
-                                        await model.updateFilenamePolicy(maxBytes: value)
-                                    }
-                                }
-                            }
-
-                            Text("The limit includes the date prefix and file extension. Veronica truncates only the original filename portion and never splits a UTF-8 character. The filesystem safety ceiling is 255 bytes.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-
-                            LabeledContent("Example") {
-                                Text("2023-01-01_Screenshot 1.jpg")
-                                    .font(.system(.body, design: .monospaced))
-                            }
-                        }
-                        .padding(.vertical, 4)
-                        .disabled(model.isRunningAnnual)
-                    }
-                }
-
-                GroupBox("Veronica data") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        LabeledContent("Location") { Text(model.snapshot?.stateDir ?? "—").textSelection(.enabled) }
-                        LabeledContent("Database") { Text(model.snapshot?.databaseExists == true ? "Ready" : "Created on first scan") }
-                        Button("Reveal Veronica Data in Finder") { model.revealStateDirectory() }
-                    }.padding(.vertical, 4)
-                }
-
-                GroupBox("Notifications") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack(alignment: .firstTextBaseline) {
-                            Toggle(
-                                "Notify when analysis or optimization finishes",
-                                isOn: Binding(
-                                    get: { model.notificationsEnabled },
-                                    set: { model.setNotificationsEnabled($0) }
-                                )
-                            )
-
-                            Spacer()
-
-                            Text(model.notificationStatus)
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(
-                                    model.notificationStatus == "Enabled"
-                                        ? Color.green
-                                        : VeronicaTheme.secondaryInk
-                                )
-                        }
-
-                        Text(model.notificationStatus == "Signed build required"
-                             ? "This local ad-hoc build cannot render native macOS notifications correctly. Use a signed Veronica build for system notifications with the app icon."
-                             : "Veronica sends notifications only for meaningful outcomes: analysis complete, analysis stopped, optimization complete, or optimization stopped.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-
-                        HStack {
-                            Button("Allow Notifications") {
-                                model.requestNotificationPermission()
-                            }
-
-                            Button("Send Test Notification") {
-                                model.sendTestNotification()
-                            }
-
-                            Button("Open macOS Notification Settings") {
-                                model.openNotificationSettings()
-                            }
-                        }
-                        .disabled(!model.notificationsEnabled)
-                    }
-                    .padding(.vertical, 4)
-                }
-
-                GroupBox("Runtime & media tools") {
-                    if let p = model.snapshot?.preflight {
-                        VStack(alignment: .leading, spacing: 12) {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(p.requiredToolsReady ? "Ready for maintenance" : "Dependencies required")
-                                        .font(.headline)
-                                    Text(p.requiredToolsReady
-                                         ? "All required runtime components are available."
-                                         : "Maintenance remains disabled until the missing requirements below are available.")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-
-                                Spacer()
-
-                                Button("Refresh") {
-                                    Task { await model.refresh() }
-                                }
-                                .disabled(model.isLoading)
-                            }
-
-                            if !p.missingRequirements.isEmpty {
-                                VStack(alignment: .leading, spacing: 6) {
-                                    Text("Missing: \(p.missingRequirements.joined(separator: ", "))")
-                                        .font(.callout.weight(.medium))
-
-                                    if p.tools["ffmpeg"]?.available != true || p.tools["ffprobe"]?.available != true {
-                                        Text("brew install ffmpeg")
-                                            .font(.system(.caption, design: .monospaced))
-                                            .textSelection(.enabled)
-                                    }
-
-                                    if p.tools["HandBrakeCLI"]?.available != true {
-                                        Text("brew install handbrake")
-                                            .font(.system(.caption, design: .monospaced))
-                                            .textSelection(.enabled)
-                                    }
-
-                                    if !p.pillow.available {
-                                        Text("python3 -m pip install Pillow==11.3.0")
-                                            .font(.system(.caption, design: .monospaced))
-                                            .textSelection(.enabled)
-                                    }
-
-                                    if p.python.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                        Text("Python 3 is required before Veronica can run its engine.")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                                .padding(10)
-                                .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
-                            }
-
-                            Divider()
-
-                            ToolRow(name: "Python / engine runtime", ready: !p.python.isEmpty, detail: p.pythonVersion)
-                            ToolRow(name: "Pillow", ready: p.pillow.available, detail: p.pillow.version)
-
-                            ForEach(["file", "ffprobe", "ffmpeg", "HandBrakeCLI", "xattr"], id: \.self) { name in
-                                ToolRow(name: name, ready: p.tools[name]?.available == true, detail: p.tools[name]?.path)
-                            }
-                        }
-                        .padding(.vertical, 4)
-                    }
-                }
-
-                GroupBox("Diagnostics") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Toggle("Developer Mode", isOn: Binding(get: { model.developerMode }, set: { model.setDeveloperMode($0) }))
-                        Text("Developer Mode keeps more detailed local engine diagnostics. It never changes media-processing policy.")
-                            .font(.caption).foregroundStyle(.secondary)
-                        HStack {
-                            Button("Copy Debug Info") { model.copyDiagnosticReport() }
-                            Button("Export Diagnostics…") { model.exportDiagnostics() }
-                            Button("Reveal Log in Finder") { model.revealLogFile() }
-                        }
-                        Text("Exported diagnostics are privacy-sanitized: home/library paths are replaced and media filenames are omitted from the structured event summary.")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }.padding(.vertical, 4)
-                }
-
-                GroupBox("About") {
-                    LabeledContent("Veronica version") { Text(model.snapshot?.version ?? "0.13.5") }
-                    Text("Veronica uses verified staging, per-file quarantine, rollback, and durable audit history.")
-                        .font(.caption).foregroundStyle(.secondary).padding(.top, 4)
-                }
-                .id("settings-bottom")
+        VStack(spacing: 0) {
+            if let errorMessage {
+                HStack {
+                    Text(errorMessage).font(.callout).foregroundStyle(.red)
+                    Spacer()
+                    Button { self.errorMessage = nil } label: { Image(systemName: "xmark") }
+                        .buttonStyle(.plain).accessibilityLabel("Dismiss error")
+                }.padding(14)
             }
-            .frame(maxWidth: 900, alignment: .leading)
-            .padding(.horizontal, 32)
-            .padding(.vertical, 26)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .task {
-                guard shouldStartAtBottomForUICapture else { return }
-
-                // Wait for the initial engine snapshot to finish populating
-                // Settings before jumping to the bottom capture anchor.
-                while model.isLoading || model.snapshot == nil {
-                    try? await Task.sleep(nanoseconds: 100_000_000)
-                }
-
-                try? await Task.sleep(nanoseconds: 300_000_000)
-
-                withAnimation(nil) {
-                    proxy.scrollTo("settings-bottom", anchor: .bottom)
-                }
-            }
+            TabView(selection: $selectedTab) {
+                defaultsContent.tabItem { Label("Defaults", systemImage: "slider.horizontal.3") }.tag("defaults")
+                presetsContent.tabItem { Label("Presets", systemImage: "square.stack") }.tag("presets")
+                supportContent.tabItem { Label("Support", systemImage: "questionmark.circle") }.tag("support")
+            }.padding(16)
         }
-        .background(VeronicaTheme.canvas)
-        .groupBoxStyle(VeronicaGroupBoxStyle(fill: VeronicaTheme.canvas))
-        .confirmationDialog(
-            "Remove this folder from Veronica?",
-            isPresented: Binding(
-                get: { pendingRemoval != nil },
-                set: { if !$0 { pendingRemoval = nil } }
-            )
-        ) {
-            Button("Remove Folder", role: .destructive) {
-                if let path = pendingRemoval {
-                    Task { await model.removeScanFolder(path) }
+        .background(VeronicaTheme.canvas).tint(VeronicaTheme.accent)
+        .onAppear { defaultSelection = model.snapshot?.defaultPresetID ?? "" }
+        .onChange(of: model.snapshot?.defaultPresetID) { defaultSelection = $0 ?? "" }
+        .sheet(item: $editorSelection) { selection in
+            PresetEditorView(preset: selection.preset, initialRecipe: selection.recipe,
+                             suggestedName: selection.suggestedName, makeDefaultOnSave: selection.makeDefault)
+                .environmentObject(model)
+        }
+        .confirmationDialog("Delete this preset?", isPresented: Binding(
+            get: { pendingPresetRemoval != nil }, set: { if !$0 { pendingPresetRemoval = nil } }
+        )) {
+            Button("Delete preset", role: .destructive) {
+                guard let preset = pendingPresetRemoval else { return }
+                pendingPresetRemoval = nil
+                Task {
+                    do { try await model.deletePreset(presetID: preset.id) }
+                    catch { errorMessage = error.localizedDescription }
                 }
-                pendingRemoval = nil
             }
-
-            Button("Cancel", role: .cancel) {
-                pendingRemoval = nil
-            }
+            Button("Cancel", role: .cancel) { pendingPresetRemoval = nil }
         } message: {
-            Text("Veronica will stop scanning this folder. Its media and Veronica history will not be deleted.")
+            Text("Folders keep their current settings. If this is your default, new folders will use Balanced instead.")
         }
     }
-}
 
-private struct SettingsNumberStepper: View {
-    let value: Int
-    let range: ClosedRange<Int>
-    let suffix: String
-    var prefix: String = ""
-    let onChange: (Int) -> Void
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Button {
-                update(value - 1)
-            } label: {
-                Image(systemName: "minus")
-                    .frame(width: 18, height: 18)
-            }
-            .buttonStyle(.bordered)
-            .help("Decrease")
-            .disabled(value <= range.lowerBound)
-
-            Text(label)
-                .font(.system(.body, design: .monospaced))
-                .lineLimit(1)
-                .frame(width: 150, alignment: .center)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
-
-            Button {
-                update(value + 1)
-            } label: {
-                Image(systemName: "plus")
-                    .frame(width: 18, height: 18)
-            }
-            .buttonStyle(.bordered)
-            .help("Increase")
-            .disabled(value >= range.upperBound)
-        }
-        .fixedSize()
-    }
-
-    private var label: String {
-        if prefix.isEmpty {
-            return "\(value) \(suffix)"
-        }
-
-        return "\(prefix) \(value) \(suffix)"
-    }
-
-    private func update(_ nextValue: Int) {
-        onChange(min(max(nextValue, range.lowerBound), range.upperBound))
-    }
-}
-
-private struct MediaExtensionGroup: View {
-    let title: String
-    let extensions: [String]
-    let enabled: Set<String>
-    let onChange: (Set<String>) -> Void
-
-    private var enabledCount: Int {
-        extensions.filter { enabled.contains($0) }.count
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(.headline)
-
-                    Text("\(enabledCount) of \(extensions.count) enabled")
-                        .font(.caption)
+    private var defaultsContent: some View {
+        Form {
+            Section {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("A good start for every new folder").font(.title3.weight(.semibold))
+                    Text("Pick the settings Veronica starts with. You can always customize a folder afterward.")
                         .foregroundStyle(.secondary)
+                }.padding(.vertical, 8)
+                RecipeChoiceMenu(title: "Start new folders with", selection: Binding(get: { defaultSelection }, set: setDefault),
+                                 choices: presets.map { ($0.id, $0.name) })
+                .disabled(busy || presets.isEmpty).accessibilityIdentifier("veronica.defaultPreset")
+            }
+            if let preset = defaultPreset {
+                Section("Current default") {
+                    summaryRow("Photos", enabled: preset.recipe.mediaProcessing.images,
+                               detail: "\(preset.recipe.optimizationSettings.imageMaxMegapixels.formatted()) MP · \(preset.recipe.optimizationSettings.imageOutputFormat.uppercased())")
+                    summaryRow("Video", enabled: preset.recipe.mediaProcessing.videos,
+                               detail: "Up to \(preset.recipe.optimizationSettings.videoMaxEdge) px")
+                    summaryRow("Audio", enabled: preset.recipe.mediaProcessing.audio, detail: "MP3 · 128 kbps")
+                    HStack { Text("File dates"); Spacer(); Text(preset.recipe.dateScope.summary).foregroundStyle(.secondary) }
+                    Button("Customize these defaults…") { edit(preset, makeDefault: true) }
+                        .disabled(busy).accessibilityIdentifier("veronica.customizeDefaults")
                 }
+            }
+            Section {
+                Label("Existing folders keep their own settings.", systemImage: "folder.badge.gearshape")
+                    .font(.callout).foregroundStyle(.secondary)
+                if model.isSavingSettings { ProgressView("Saving…").controlSize(.small) }
+                if model.isAnalyzing || model.isRunningAnnual {
+                    Text("You can change defaults when the current scan or cleanup finishes.").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }.formStyle(.grouped)
+    }
 
+    private var presetsContent: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Saved presets").font(.title3.weight(.semibold))
+                    Text("Customize a built-in preset or create your own.").foregroundStyle(.secondary)
+                }
                 Spacer()
-
-                Button(enabledCount == extensions.count ? "Turn All Off" : "Turn All On") {
-                    onChange(enabledCount == extensions.count ? Set<String>() : Set(extensions))
-                }
-                .buttonStyle(.link)
-            }
-
-            LazyVGrid(
-                columns: [
-                    GridItem(.adaptive(minimum: 78), spacing: 8, alignment: .leading)
-                ],
-                alignment: .leading,
-                spacing: 8
-            ) {
-                ForEach(extensions, id: \.self) { ext in
-                    Toggle(ext.uppercased(), isOn: Binding(
-                        get: { enabled.contains(ext) },
-                        set: { isOn in
-                            var next = enabled
-                            if isOn {
-                                next.insert(ext)
-                            } else {
-                                next.remove(ext)
+                Button("New preset…") {
+                    editorSelection = PresetEditorSelection(preset: nil, recipe: defaultPreset?.recipe ?? .recommended, suggestedName: availableName("My preset"))
+                }.disabled(busy).accessibilityIdentifier("veronica.newPreset")
+            }.padding(.horizontal, 12).padding(.top, 10)
+            ScrollView {
+                VStack(spacing: 10) {
+                    ForEach(presets) { preset in
+                        HStack(spacing: 14) {
+                            Image(systemName: "slider.horizontal.3").font(.title3).foregroundStyle(VeronicaTheme.accent)
+                            VStack(alignment: .leading, spacing: 5) {
+                                HStack(spacing: 8) {
+                                    Text(preset.name).font(.headline)
+                                    if preset.id == model.snapshot?.defaultPresetID {
+                                        Text("Default").font(.caption).foregroundStyle(VeronicaTheme.accent)
+                                    }
+                                }
+                                Text(preset.recipe.displaySummary).font(.caption).foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                if preset.builtIn { Text("Built-in · customize to create your own copy").font(.caption2).foregroundStyle(.secondary) }
                             }
-                            onChange(next)
+                            Spacer(minLength: 6)
+                            Button(preset.builtIn ? "Customize…" : "Edit…") { edit(preset) }
+                                .accessibilityIdentifier("veronica.editPreset.\(preset.id)")
+                            Menu {
+                                Button("Use for new folders") { setDefault(preset.id) }
+                                Button("Duplicate…") {
+                                    editorSelection = PresetEditorSelection(preset: nil, recipe: preset.recipe, suggestedName: availableName("\(preset.name) Copy"))
+                                }
+                                if !preset.builtIn {
+                                    Button("Delete…", role: .destructive) { pendingPresetRemoval = preset }
+                                }
+                            } label: { Image(systemName: "ellipsis") }
+                            .menuStyle(.borderlessButton).fixedSize().accessibilityLabel("Options for \(preset.name)")
                         }
-                    ))
-                    .toggleStyle(.checkbox)
-                    .font(.callout)
+                        .padding(16).frame(maxWidth: .infinity, alignment: .leading)
+                        .background(VeronicaTheme.subtleFill, in: RoundedRectangle(cornerRadius: 14))
+                        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(VeronicaTheme.border.opacity(0.5)))
+                        .disabled(busy)
+                    }
+                }.padding(12)
+            }
+        }
+    }
+
+    private var supportContent: some View {
+        Form {
+            Section("Veronica") {
+                HStack { Text("Version"); Spacer(); Text(model.snapshot?.version ?? "—").foregroundStyle(.secondary) }
+                Label(model.snapshot?.preflight.requiredToolsReady == true ? "Ready to scan and optimize" : "Some components need attention",
+                      systemImage: model.snapshot?.preflight.requiredToolsReady == true ? "checkmark.circle" : "exclamationmark.triangle")
+                Button("Check again") { Task { await model.refresh() } }.disabled(model.isLoading)
+                if let missing = model.snapshot?.preflight.missingRequirements, !missing.isEmpty {
+                    Text("Missing: \(missing.joined(separator: ", "))").font(.caption).foregroundStyle(.secondary)
                 }
             }
-        }
-        .padding(.vertical, 2)
-    }
-}
-
-private struct SettingsNumericField: View {
-    @Binding var text: String
-    @FocusState private var isFocused: Bool
-
-    let range: ClosedRange<Int>
-    let suffix: String
-    var prefix: String = ""
-    let onCommit: (Int) -> Void
-
-    var body: some View {
-        HStack(spacing: 8) {
-            if !prefix.isEmpty {
-                Text(prefix)
-                    .foregroundStyle(.secondary)
+            Section("Change logs") {
+                Text("Each Smart cleanup gets its own dated log, with all folders and completed changes together. Manual date edits have separate logs. Logs remain after you quit Veronica.")
+                    .font(.callout).foregroundStyle(.secondary)
+                Button("Show change logs") { model.revealChangeLogs() }
+                    .accessibilityIdentifier("veronica.showChangeLogs")
             }
-
-            TextField("", text: $text)
-                .textFieldStyle(.roundedBorder)
-                .font(.system(.body, design: .monospaced))
-                .frame(width: 72)
-                .multilineTextAlignment(.trailing)
-                .focused($isFocused)
-                .onSubmit(commit)
-
-            Text(suffix)
-                .foregroundStyle(.secondary)
-        }
-        .fixedSize()
-        .onChange(of: text) { newValue in
-            let filtered = newValue.filter(\.isNumber)
-            if filtered != newValue {
-                text = filtered
+            Section("Help with a problem") {
+                Text("Export a report to help investigate a problem. Media filenames are omitted from the report.")
+                    .font(.callout).foregroundStyle(.secondary)
+                HStack {
+                    Button("Export report…") { model.exportDiagnostics() }
+                    Button("Copy report") { model.copyDiagnosticReport() }
+                }
+                SettingsDisclosure("Advanced") {
+                    Toggle("Detailed local logging", isOn: Binding(get: { model.developerMode }, set: { model.setDeveloperMode($0) }))
+                    Button("Show diagnostic log in Finder") { model.revealLogFile() }
+                    Button("Show Veronica data in Finder") { model.revealStateDirectory() }
+                    if let preflight = model.snapshot?.preflight {
+                        Text("Python \(preflight.pythonVersion ?? "") · Pillow \(preflight.pillow.version ?? "")")
+                            .font(.caption).foregroundStyle(.secondary)
+                        ForEach(["ffmpeg", "ffprobe", "HandBrakeCLI"], id: \.self) { tool in
+                            HStack {
+                                Text(tool)
+                                Spacer()
+                                Text(preflight.tools[tool]?.available == true ? "Available" : "Missing").foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
             }
-        }
-        .onChange(of: isFocused) { focused in
-            if !focused {
-                commit()
-            }
-        }
+        }.formStyle(.grouped)
     }
 
-    private func commit() {
-        let parsed = Int(text) ?? range.lowerBound
-        let clamped = min(max(parsed, range.lowerBound), range.upperBound)
-        text = "\(clamped)"
-        onCommit(clamped)
+    private func summaryRow(_ title: String, enabled: Bool, detail: String) -> some View {
+        HStack { Text(title); Spacer(); Text(enabled ? detail : "Leave unchanged").foregroundStyle(.secondary) }
     }
-}
-
-private struct ToolRow: View {
-    let name: String
-    let ready: Bool
-    let detail: String?
-    var body: some View {
-        HStack {
-            Image(systemName: ready ? "checkmark.circle.fill" : "xmark.circle.fill")
-                .foregroundStyle(ready ? Color.green : Color.red)
-            Text(name)
-            Spacer()
-            if let detail, !detail.isEmpty {
-                Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-            }
+    private func availableName(_ base: String) -> String {
+        let names = Set(presets.map { $0.name.lowercased() })
+        var name = base; var count = 2
+        while names.contains(name.lowercased()) { name = "\(base) \(count)"; count += 1 }
+        return name
+    }
+    private func edit(_ preset: SettingsPreset, makeDefault: Bool = false) {
+        editorSelection = PresetEditorSelection(preset: preset, recipe: preset.recipe,
+            suggestedName: preset.builtIn ? availableName("\(preset.name) Custom") : preset.name,
+            makeDefault: makeDefault)
+    }
+    private func setDefault(_ id: String) {
+        guard !busy, !id.isEmpty else { return }
+        defaultSelection = id
+        Task {
+            do { try await model.setDefaultPreset(presetID: id) }
+            catch { defaultSelection = model.snapshot?.defaultPresetID ?? ""; errorMessage = error.localizedDescription }
         }
     }
 }

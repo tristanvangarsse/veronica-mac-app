@@ -28,12 +28,12 @@ def main() -> int:
         )
         assert proc.returncode == 0, proc.stdout + proc.stderr
         data = json.loads(proc.stdout)
-        assert data["version"] == "0.13.5"
+        assert data["version"] == mm.VERSION
         assert data["state_dir"] == str(state.resolve())
         assert data["active_assets"] == 0
         assert data["unresolved_reviews"] == []
         assert data["recent_changes"] == []
-        assert data["annual"]["cutoff_exclusive"].endswith("-01-01")
+        assert data["annual"]["cutoff_exclusive"] == mm.audit.calendar_years_before(mm.dt.date.today(), 2).isoformat()
     print("Veronica UI snapshot: PASS")
     return 0
 

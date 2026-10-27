@@ -23,10 +23,11 @@ import subprocess
 import sys
 import unicodedata
 import warnings
+import media_security as security
 from collections import Counter, defaultdict
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 VERSION = "0.1.4"
 
@@ -41,24 +42,22 @@ DATE_YMD = re.compile(r"(?<!\d)(?P<y>19\d{2}|20\d{2})[-_](?P<m>0[1-9]|1[0-2])[-_
 DATE_YYMMDD = re.compile(r"(?<!\d)(?P<y>\d{2})(?P<m>0[1-9]|1[0-2])(?P<d>0[1-9]|[12]\d|3[01])[-_](?=\D|$)")
 YEAR_DIR = re.compile(r"^(19\d{2}|20\d{2})$")
 
+DEFAULT_EXCLUDED_DIRECTORY_NAMES: list[str] = []
+
 DEFAULT_CONFIG = {
+    "date_evidence_policy": "embedded_only",
     "archive_age_years": 2,
     "compressed_tags": ["compressed-v2", "_compressed-v2"],
     "ignore_names": [".DS_Store"],
-    "roots": {
-        "Streams": {"mode": "audit", "expected_subfolders": {"Image": "image", "Video": "video", "Audio": "audio"}},
-        "Photo_Library": {
-            "mode": "audit_cautious",
-            "protected_directory_names": ["RAW", "Capture", "CaptureOne", "Photoshop", "Original", "Retouch", "Assets", "Unused", "Masters", "Master", "Source", "Working", "Negatives"]
-        },
-        "Imagehead": {"mode": "read_only_archive"}
-    },
+    "roots": {},
+    "excluded_directory_names": DEFAULT_EXCLUDED_DIRECTORY_NAMES,
     "full_hash": False,
     "hash_algorithm": "sha256",
     "probe_media": True,
     "probe_unknown_with_file": True,
     "audio_min_size_mb": 10,
-    "streams_image_max_megapixels": 10,
+    "image_max_megapixels": 20,
+    "streams_image_max_megapixels": 20,
     "photo_library_max_megapixels": 20
 }
 
@@ -69,9 +68,9 @@ def eprint(*args: Any) -> None:
 
 def run_cmd(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
     try:
-        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+        p = security.bounded_run(args, timeout=timeout, reads=[Path(args[-1])])
         return p.returncode, p.stdout, p.stderr
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         return 127, "", str(exc)
 
 
@@ -132,16 +131,12 @@ def file_hash(path: Path, algorithm: str = "sha256") -> str:
 
 
 def quick_hash(path: Path) -> str:
-    """Stable sampling hash for inventory change detection, not duplicate proof."""
+    """Inventory identity covers all bytes; old sampled plans require reanalysis."""
     h = hashlib.sha256()
-    size = path.stat().st_size
-    h.update(str(size).encode())
-    with path.open("rb", buffering=0) as f:
-        first = f.read(1024 * 1024)
-        h.update(first)
-        if size > 2 * 1024 * 1024:
-            f.seek(max(0, size - 1024 * 1024))
-            h.update(f.read(1024 * 1024))
+    h.update(str(path.stat().st_size).encode())
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+            h.update(chunk)
     return h.hexdigest()
 
 
@@ -251,7 +246,7 @@ def finder_tags(path: Path) -> list[str]:
 
 
 def file_mime(path: Path) -> Optional[str]:
-    if not shutil.which("file"):
+    if not security.resolve_tool("file"):
         return mimetypes.guess_type(path.name)[0]
     rc, out, _ = run_cmd(["file", "--brief", "--mime-type", str(path)], timeout=10)
     return out.strip() if rc == 0 and out.strip() else mimetypes.guess_type(path.name)[0]
@@ -266,11 +261,11 @@ def kind_from_mime(mime: Optional[str]) -> Optional[str]:
 
 
 def probe_ffprobe(path: Path) -> dict[str, Any]:
-    if not shutil.which("ffprobe"):
+    if not security.resolve_tool("ffprobe"):
         return {}
     rc, out, err = run_cmd([
         "ffprobe", "-v", "error", "-show_entries",
-        "format=duration,bit_rate,format_name:stream=index,codec_type,codec_name,width,height,channels,sample_rate,avg_frame_rate,r_frame_rate:stream_tags=rotate,creation_time:format_tags=creation_time",
+        "format=duration,bit_rate,format_name:stream=index,codec_type,codec_name,width,height,channels,sample_rate,avg_frame_rate,r_frame_rate:stream_tags=rotate,creation_time,date,com.apple.quicktime.creationdate:format_tags=creation_time,date,com.apple.quicktime.creationdate",
         "-of", "json", str(path)
     ], timeout=60)
     if rc != 0:
@@ -283,23 +278,25 @@ def probe_ffprobe(path: Path) -> dict[str, Any]:
     fmt = data.get("format", {}) or {}
     for key in ("duration", "bit_rate", "format_name"):
         if key in fmt: result[key] = fmt[key]
-    if isinstance(fmt.get("tags"), dict) and fmt["tags"].get("creation_time"):
-        result["embedded_creation_time"] = fmt["tags"]["creation_time"]
     streams = data.get("streams", []) or []
+    result.update(embedded_av_date(data))
     result["streams"] = streams
     for s in streams:
         if s.get("codec_type") == "video" and "video_codec" not in result:
             result.update({"video_codec": s.get("codec_name"), "width": s.get("width"), "height": s.get("height")})
             tags = s.get("tags") or {}
             if tags.get("rotate") is not None: result["rotation"] = tags.get("rotate")
-            if tags.get("creation_time") and "embedded_creation_time" not in result:
-                result["embedded_creation_time"] = tags.get("creation_time")
         if s.get("codec_type") == "audio" and "audio_codec" not in result:
             result.update({"audio_codec": s.get("codec_name"), "channels": s.get("channels"), "sample_rate": s.get("sample_rate")})
     return result
 
 
 def probe_image(path: Path) -> dict[str, Any]:
+    if not security._WORKER:
+        try:
+            return security.image_request("probe", {"source": str(path.resolve())}, reads=[path])
+        except Exception as exc:
+            return {"probe_error": "Image could not be opened by the restricted decoder"}
     try:
         from PIL import Image  # type: ignore
     except ImportError:
@@ -309,7 +306,7 @@ def probe_image(path: Path) -> dict[str, Any]:
         # audit information, but it should not look like a failed scan in Terminal.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", Image.DecompressionBombWarning)
-            with Image.open(path) as im:
+            with Image.open(path, formats=security.pillow_formats()) as im:
                 frames = int(getattr(im, "n_frames", 1) or 1)
                 pixels = int(im.width) * int(im.height)
                 max_pixels = getattr(Image, "MAX_IMAGE_PIXELS", None)
@@ -320,6 +317,7 @@ def probe_image(path: Path) -> dict[str, Any]:
                 true_animated = bool(frames > 1 and fmt in {"GIF", "PNG", "WEBP"})
                 multi_frame = bool(frames > 1 and not true_animated)
                 return {
+                    **embedded_image_date(im),
                     "width": im.width,
                     "height": im.height,
                     "megapixels": round(pixels / 1_000_000, 3),
@@ -347,11 +345,55 @@ def parse_embedded_date(value: Any) -> Optional[dt.date]:
     except ValueError: return None
 
 
+def embedded_image_date(image) -> dict[str, Any]:
+    """Read capture metadata inside the restricted image worker."""
+    exif = image.getexif()
+    try:
+        photo_exif = exif.get_ifd(34665)
+    except (KeyError, ValueError, TypeError, SyntaxError):
+        photo_exif = {}
+    candidates = []
+    for tag, name in ((36867, "DateTimeOriginal"), (36868, "DateTimeDigitized")):
+        candidates.extend((name, source.get(tag)) for source in (photo_exif, exif))
+    # XMP is embedded metadata too. Read only explicit date fields, without
+    # invoking an XML parser or resolving external references.
+    xmp = image.info.get("xmp") or image.info.get("XML:com.adobe.xmp") or ""
+    if isinstance(xmp, bytes):
+        xmp = xmp.decode("utf-8", errors="replace")
+    if len(xmp) <= 1024 * 1024:
+        for field in ("DateTimeOriginal", "CreateDate"):
+            for pattern in (rf'{field}\s*=\s*[\"\']([^\"\']+)', rf'<(?:\w+:)?{field}[^>]*>([^<]+)'):
+                for match in re.finditer(pattern, xmp):
+                    candidates.append(("XMP " + field, match.group(1)))
+    candidates.append(("DateTime", exif.get(306)))
+    candidates.extend((key, image.info.get(key)) for key in ("Creation Time", "creation_time", "date:create"))
+    for field, value in candidates:
+        if parse_embedded_date(value) is not None:
+            return {"embedded_creation_time": str(value), "embedded_date_field": field}
+    return {}
+
+
+def embedded_av_date(probe: dict[str, Any]) -> dict[str, Any]:
+    sources = [(probe.get("format") or {}).get("tags") or {}]
+    sources += [stream.get("tags") or {} for stream in probe.get("streams") or []]
+    for key in ("com.apple.quicktime.creationdate", "creation_time", "date"):
+        for tags in sources:
+            value = next((v for k,v in tags.items() if k.casefold() == key), None)
+            if parse_embedded_date(value) is not None:
+                return {"embedded_creation_time": value, "embedded_date_field": key}
+    return {}
+
+
 @dataclass
 class Decision:
     safety: str
     action: str
     reason: str
+
+
+def is_photo_library_path(rel: Path, root: Path) -> bool:
+    names = {"photo_library", "photo library"}
+    return any(part.casefold() in names for part in (*root.parts, *rel.parts[:-1]))
 
 
 class Auditor:
@@ -377,84 +419,29 @@ class Auditor:
         return first, self.config.get("roots", {}).get(first, {"mode": "unknown"})
 
     def expected_kind(self, rel: Path) -> Optional[str]:
-        if len(rel.parts) >= 2 and rel.parts[0] == "Streams":
-            return self.config.get("roots", {}).get("Streams", {}).get("expected_subfolders", {}).get(rel.parts[1])
         return None
 
     def protected_photo_path(self, rel: Path) -> bool:
-        if not rel.parts or rel.parts[0] != "Photo_Library": return False
-        names = {str(x).casefold() for x in self.config.get("roots", {}).get("Photo_Library", {}).get("protected_directory_names", [])}
-        return any(p.casefold() in names for p in rel.parts[:-1])
+        # User-selected directory exclusions apply to every library layout.
+        names = {str(value).casefold() for value in self.config.get("excluded_directory_names", DEFAULT_EXCLUDED_DIRECTORY_NAMES)}
+        return any(part.casefold() in names for part in rel.parts[:-1])
 
     def resolve_date(self, row: dict[str, Any]) -> None:
         filename_date = parse_filename_date(row["name"])
         embedded_date = parse_embedded_date(row.get("embedded_creation_time"))
         birth_date = dt.datetime.fromtimestamp(row["birth_ts"]).date() if row.get("birth_ts") else None
-        mtime_date = dt.datetime.fromtimestamp(row["mtime_ts"]).date() if row.get("mtime_ts") else None
         folder_year = row.get("folder_year")
-        rel = Path(row["relpath"])
-        root_name = rel.parts[0] if rel.parts else ""
         row["filename_date"] = filename_date.isoformat() if filename_date else None
         row["embedded_date"] = embedded_date.isoformat() if embedded_date else None
         row["birth_date"] = birth_date.isoformat() if birth_date else None
-        row["embedded_date_role"] = None
-
-        # Date evidence rules:
-        # - exact embedded/filename agreement is strongest;
-        # - a +/-1 day difference is treated as timezone/day-boundary tolerance and the
-        #   filename date is kept, preventing New Year's Eve UTC rollover false positives;
-        # - if filename and filesystem birth date agree while embedded metadata is much
-        #   later, the embedded date is treated as likely processing/transcode metadata;
-        # - otherwise a material embedded/filename disagreement remains a review conflict.
-        if embedded_date and filename_date:
-            delta = (embedded_date - filename_date).days
-            if delta == 0:
-                best, conf, src = embedded_date, "HIGH", "embedded_filename_agree"
-            elif abs(delta) <= 1:
-                best, conf, src = filename_date, "HIGH", "filename_embedded_timezone_tolerance"
-                row["embedded_date_role"] = "timezone_boundary"
-            elif birth_date and abs((birth_date - filename_date).days) <= 1 and embedded_date > filename_date:
-                best, conf, src = filename_date, "MEDIUM", "filename_birth_agree"
-                row["embedded_date_role"] = "likely_processing_date"
-            else:
-                row.update(best_date=None, date_confidence="CONFLICT", date_source="embedded_vs_filename")
-                row["folder_year_mismatch"] = bool(folder_year and filename_date.year != int(folder_year))
-                row["folder_year_role"] = "project_grouping" if root_name == "Photo_Library" else "archive_year"
-                return
-        elif embedded_date:
-            best, conf, src = embedded_date, "HIGH", "embedded"
-        elif filename_date:
-            best, conf, src = filename_date, "MEDIUM", "filename"
-        elif (
-            birth_date
-            and mtime_date
-            and folder_year
-            and root_name == "Streams"
-            and birth_date == mtime_date
-            and birth_date.year == int(folder_year)
-        ):
-            # In the structured Streams archive, three independent pieces of
-            # ordinary filesystem/archive evidence agree: birth date, mtime,
-            # and containing year. That is strong enough for normal policy
-            # evaluation without inventing an exact date from the folder.
-            best, conf, src = (
-                birth_date,
-                "MEDIUM",
-                "filesystem_birth_mtime_folder_agree",
-            )
-        elif birth_date:
-            best, conf, src = birth_date, "LOW", "filesystem_birth"
-        elif folder_year and root_name != "Photo_Library":
-            best, conf, src = dt.date(int(folder_year), 7, 1), "LOW", "folder_year_midpoint"
-        else:
-            row.update(best_date=None, date_confidence="UNKNOWN", date_source=None)
-            row["folder_year_mismatch"] = False
-            row["folder_year_role"] = "project_grouping" if root_name == "Photo_Library" else "archive_year"
-            return
-
-        row["folder_year_mismatch"] = bool(folder_year and best.year != int(folder_year))
-        row["folder_year_role"] = "project_grouping" if root_name == "Photo_Library" else "archive_year"
-        row.update(best_date=best.isoformat(), date_confidence=conf, date_source=src)
+        row["embedded_date_role"] = "authoritative" if embedded_date else None
+        # Other dates are retained only as diagnostic information. They never
+        # determine eligibility or naming, including when embedded data is absent.
+        row["folder_year_mismatch"] = bool(embedded_date and folder_year and embedded_date.year != int(folder_year))
+        row["folder_year_role"] = "archive_year"
+        row.update(best_date=embedded_date.isoformat() if embedded_date else None,
+                   date_confidence="HIGH" if embedded_date else "UNKNOWN",
+                   date_source="embedded" if embedded_date else None)
 
     def decide(self, row: dict[str, Any]) -> Decision:
         rel = Path(row["relpath"])
@@ -468,16 +455,8 @@ class Auditor:
             return Decision("RED", "PRESERVE", "symlink_not_followed")
         if row.get("cross_filesystem"):
             return Decision("RED", "PRESERVE", "cross_filesystem_boundary")
-        # Named root policies are retained for historical Veronica archive
-        # layouts, but arbitrary user-configured scan folders must remain
-        # structure-agnostic. An unknown top-level directory is therefore
-        # evaluated by detected media type instead of being preserved solely
-        # because of its folder name.
-        if root_name in self.config.get("roots", {}):
-            if policy.get("mode") == "read_only_archive":
-                return Decision("RED", "PRESERVE", "root_policy_read_only_archive")
         if self.protected_photo_path(rel):
-            return Decision("RED", "PRESERVE", "protected_photo_project_path")
+            return Decision("RED", "PRESERVE", "excluded_directory")
         if ext_kind in {"master_image", "project", "document"}:
             return Decision("RED", "PRESERVE", f"protected_or_nonmedia_extension:{row['extension'] or '[none]'}")
         if kind not in {"image", "video", "audio"}:
@@ -490,7 +469,7 @@ class Auditor:
             best_date = dt.date.fromisoformat(row["best_date"])
             scope_mode = str(self.date_scope.get("mode") or "legacy")
 
-            if scope_mode == "legacy":
+            if scope_mode in {"legacy", "older_than_two_years"}:
                 if best_date >= self.cutoff:
                     return Decision("GREEN", "SKIP", "date_scope_excluded")
             elif scope_mode == "within":
@@ -512,15 +491,17 @@ class Auditor:
             return Decision("YELLOW", "REVIEW", "empty_file")
         if row.get("probe_error"):
             return Decision("YELLOW", "REVIEW", "media_probe_failed")
+        if row.get("extension", "").lower() == ".gif":
+            return Decision("RED", "PRESERVE", "gif_preserved_by_manual_policy")
         if row.get("animated"):
             return Decision("RED", "PRESERVE", "true_animated_image")
         expected = row.get("expected_kind")
         if expected and expected != kind:
             return Decision("YELLOW", "REVIEW", f"category_mismatch:expected_{expected}_detected_{kind}")
-        if row.get("folder_year_mismatch") and root_name != "Photo_Library":
-            return Decision("YELLOW", "REVIEW", "folder_year_conflicts_with_resolved_date")
-        if row.get("date_confidence") in {"CONFLICT", "UNKNOWN"}:
-            return Decision("YELLOW", "REVIEW", f"date_{row.get('date_confidence', 'unknown').lower()}")
+        if row.get("date_confidence") == "UNKNOWN" or not row.get("best_date"):
+            return Decision("YELLOW", "REVIEW", "embedded_date_missing")
+        if row.get("date_confidence") == "CONFLICT":
+            return Decision("YELLOW", "REVIEW", "date_conflict")
         if row.get("date_confidence") == "LOW":
             return Decision("YELLOW", "REVIEW", "date_low_confidence")
         if not row.get("best_date"):
@@ -611,7 +592,15 @@ class Auditor:
         self.name_buckets[collision_key].append(row["relpath"])
         self.rows.append(row)
 
-    def walk(self) -> None:
+    def walk(self, on_progress: Optional[Callable[[int, int], None]] = None) -> None:
+        pending_files: list[tuple[Path, bool]] = []
+
+        def visit_file(path: Path, is_symlink: bool) -> None:
+            if on_progress is None:
+                self.scan_file(path, is_symlink=is_symlink)
+            else:
+                pending_files.append((path, is_symlink))
+
         def onerror(exc: OSError) -> None:
             self.issues.append((getattr(exc, "filename", "?"), "walk_error", str(exc)))
 
@@ -631,7 +620,7 @@ class Auditor:
             for name in dirnames:
                 p = dpath / name
                 if p.is_symlink():
-                    self.scan_file(p, is_symlink=True)
+                    visit_file(p, is_symlink=True)
                 else:
                     kept.append(name)
             dirnames[:] = kept
@@ -639,7 +628,14 @@ class Auditor:
                 if name in set(self.config.get("ignore_names", [])):
                     continue
                 p = dpath / name
-                self.scan_file(p, is_symlink=p.is_symlink())
+                visit_file(p, is_symlink=p.is_symlink())
+
+        if on_progress is not None:
+            total = len(pending_files)
+            on_progress(0, total)
+            for completed, (path, is_symlink) in enumerate(pending_files, 1):
+                self.scan_file(path, is_symlink=is_symlink)
+                on_progress(completed, total)
 
         collisions = [paths for paths in self.name_buckets.values() if len(paths) > 1]
         collision_members = {p for group in collisions for p in group}

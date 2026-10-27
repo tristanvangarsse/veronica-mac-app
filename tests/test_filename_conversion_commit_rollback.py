@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 
 from PIL import Image
+from fixture_dates import exif_date
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,13 +39,13 @@ with tempfile.TemporaryDirectory(prefix="veronica-filename-convert-") as tmp:
     source_dir.mkdir(parents=True)
     state.mkdir(parents=True)
 
-    original_name = "230101-large-image.jpg"
+    original_name = "2023-01-01_large image.jpg"
     original_relpath = f"Streams/Image/2023/{original_name}"
     original_path = source_dir / original_name
 
     # >10 MP so Streams image policy actually converts it.
     im = Image.new("RGB", (4000, 3000), (120, 80, 40))
-    im.save(original_path, format="JPEG", quality=95)
+    im.save(original_path, format="JPEG", quality=95, exif=exif_date())
 
     # Give filesystem evidence a stable 2023-01-01 date.
     stamp = dt.datetime(2023, 1, 1, 12, 0, 0).timestamp()
@@ -64,7 +65,7 @@ with tempfile.TemporaryDirectory(prefix="veronica-filename-convert-") as tmp:
 
     item = next(i for i in plan["items"] if i["relpath"] == original_relpath)
     assert item["operation"] == "CONVERT_IMAGE", item
-    expected_relpath = "Streams/Image/2023/2023-01-01_230101-large-image.jpg"
+    expected_relpath = "Streams/Image/2023/230101-large-image.jpg"
     assert item["target"]["final_relpath"] == expected_relpath, item
 
     run([

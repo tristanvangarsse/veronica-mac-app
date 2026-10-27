@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import hashlib
+import json
 import shutil
 import subprocess
 import sys
@@ -55,6 +56,7 @@ def main() -> int:
         video_dir.mkdir(parents=True)
         state.mkdir()
 
+        (state / 'settings.json').write_text(json.dumps({"process_images":False, "filename_date_format":"YYYY-MM-DD_"}))
         image = image_dir / "2023-01-01_test-image.jpg"
         video = video_dir / "2023-01-01_test-video.mov"
 
@@ -76,6 +78,7 @@ def main() -> int:
             "-t", "2",
             "-c:v", "prores_ks",
             "-profile:v", "3",
+            "-metadata", "creation_time=2023-01-01T12:00:00Z",
             str(video),
         ], project)
 

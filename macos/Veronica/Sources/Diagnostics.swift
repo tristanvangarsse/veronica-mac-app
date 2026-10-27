@@ -133,14 +133,10 @@ final class DiagnosticsCenter: @unchecked Sendable {
                 lines.append("- Remaining executable: \(plan.remainingExecutableCount ?? plan.executableCount)")
                 lines.append("- Latest-plan unresolved reviews: \(plan.unresolvedReviewCount)")
             }
-            if !snapshot.unresolvedReviews.isEmpty {
-                let reasons = Dictionary(grouping: snapshot.unresolvedReviews, by: { $0.reason }).mapValues { $0.count }
-                for key in reasons.keys.sorted() { lines.append("- Review reason \(key): \(reasons[key] ?? 0)") }
-            }
             lines.append("")
             lines.append("Runtime")
             lines.append("- Python/runtime: \(snapshot.preflight.pythonVersion)")
-            lines.append("- Engine executable: \(sanitize(snapshot.preflight.python, snapshot: snapshot))")
+            lines.append("- Engine executable: path omitted")
             lines.append("- Engine source: \(runtimeSource(for: snapshot.preflight.python))")
             lines.append("- Pillow: \(snapshot.preflight.pillow.available ? (snapshot.preflight.pillow.version ?? "available") : "missing")")
 
@@ -153,7 +149,7 @@ final class DiagnosticsCenter: @unchecked Sendable {
                 let toolPath = status?.path
 
                 if ready, let toolPath, !toolPath.isEmpty {
-                    lines.append("- \(tool): available | \(sanitize(toolPath, snapshot: snapshot)) | \(runtimeSource(for: toolPath))")
+                    lines.append("- \(tool): available | \(runtimeSource(for: toolPath))")
                 } else {
                     lines.append("- \(tool): missing")
                 }
@@ -176,16 +172,16 @@ final class DiagnosticsCenter: @unchecked Sendable {
         if let errorMessage, !errorMessage.isEmpty {
             lines.append("")
             lines.append("Last app error")
-            lines.append(sanitize(errorMessage, snapshot: snapshot))
+            lines.append("An error occurred. Free-form details are omitted to protect filenames and document contents.")
         }
 
         if !events.isEmpty {
             lines.append("")
             lines.append("Recent structured events (filenames omitted)")
             for event in events.suffix(30) {
-                var parts = [event.event]
-                if let status = event.status { parts.append("status=\(status)") }
-                if let error = event.error { parts.append("error=\(sanitize(error, snapshot: snapshot))") }
+                var parts = ["engine event"]
+                if let status = event.status, ["COMMITTED", "ROLLED_BACK", "FAILED", "STAGED_VERIFIED", "KEEP_ORIGINAL", "RUNNING", "COMPLETE"].contains(status) { parts.append("status=\(status)") }
+                if event.error != nil { parts.append("error details omitted") }
                 if let index = event.index, let total = event.total { parts.append("progress=\(index)/\(total)") }
                 lines.append("- " + parts.joined(separator: " "))
             }
@@ -194,27 +190,10 @@ final class DiagnosticsCenter: @unchecked Sendable {
     }
 
     func sanitizedRecentLog(snapshot: UISnapshot?) -> String {
-        recentLog().split(separator: "\n", omittingEmptySubsequences: false)
-            .map { sanitize(String($0), snapshot: snapshot) }
-            .joined(separator: "\n")
-    }
-
-    private func sanitize(_ input: String, snapshot: UISnapshot?) -> String {
-        var value = input
-        let home = fm.homeDirectoryForCurrentUser.path
-        value = value.replacingOccurrences(of: home, with: "<HOME>")
-        if let snapshot {
-            for (index, root) in snapshot.scanFolders.enumerated() where !root.isEmpty {
-                value = value.replacingOccurrences(
-                    of: root,
-                    with: "<SCAN_FOLDER_\(index + 1)>"
-                )
-            }
-        }
-        if let state = snapshot?.stateDir, !state.isEmpty {
-            value = value.replacingOccurrences(of: state, with: "<VERONICA_STATE>")
-        }
-        return value
+        let entries = recentLog().split(separator: "\n")
+        let errors = entries.filter { $0.contains("[ERROR]") }.count
+        let warnings = entries.filter { $0.contains("[WARNING]") }.count
+        return "Private log messages omitted. Recent entries: \(entries.count), errors: \(errors), warnings: \(warnings).\n"
     }
 
     func exportDiagnostics(to destination: URL, snapshot: UISnapshot?, errorMessage: String?, events: [EngineEvent]) throws {
