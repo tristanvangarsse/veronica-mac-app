@@ -248,7 +248,7 @@ private struct ReviewThumbnail: View {
     }
 }
 
-private final class ReviewQuickLookController: NSObject, QLPreviewPanelDataSource {
+final class ReviewQuickLookController: NSObject, QLPreviewPanelDataSource {
     static let shared = ReviewQuickLookController()
 
     private var previewURL: URL?

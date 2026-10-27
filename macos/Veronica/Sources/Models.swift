@@ -1,16 +1,25 @@
 import Foundation
 
-struct MediaProcessingPolicy: Codable {
-    let images: Bool
-    let videos: Bool
-    let audio: Bool
-    let imageExtensions: [String]
-    let videoExtensions: [String]
-    let audioExtensions: [String]
+struct MediaProcessingPolicy: Codable, Equatable {
+    var images: Bool
+    var videos: Bool
+    var audio: Bool
+    var imageExtensions: [String]
+    var videoExtensions: [String]
+    var audioExtensions: [String]
+    var excludedDirectoryNames: [String]
+
+    static let defaultExcludedDirectoryNames: [String] = []
 
     static let allImageExtensions = [".bmp", ".gif", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".webp"]
     static let allVideoExtensions = [".3gp", ".avi", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4", ".mts", ".webm"]
     static let allAudioExtensions = [".aac", ".aif", ".aiff", ".amr", ".flac", ".m4a", ".m4r", ".mp3", ".ogg", ".opus", ".wav"]
+
+    static let recommended = MediaProcessingPolicy(
+        images: true, videos: true, audio: true,
+        imageExtensions: allImageExtensions.filter { $0 != ".gif" },
+        videoExtensions: allVideoExtensions, audioExtensions: allAudioExtensions
+    )
 
     enum CodingKeys: String, CodingKey {
         case images
@@ -19,6 +28,7 @@ struct MediaProcessingPolicy: Codable {
         case imageExtensions = "image_extensions"
         case videoExtensions = "video_extensions"
         case audioExtensions = "audio_extensions"
+        case excludedDirectoryNames = "excluded_directory_names"
     }
 
     init(
@@ -27,7 +37,8 @@ struct MediaProcessingPolicy: Codable {
         audio: Bool,
         imageExtensions: [String],
         videoExtensions: [String],
-        audioExtensions: [String]
+        audioExtensions: [String],
+        excludedDirectoryNames: [String] = Self.defaultExcludedDirectoryNames
     ) {
         self.images = images
         self.videos = videos
@@ -35,13 +46,14 @@ struct MediaProcessingPolicy: Codable {
         self.imageExtensions = imageExtensions
         self.videoExtensions = videoExtensions
         self.audioExtensions = audioExtensions
+        self.excludedDirectoryNames = excludedDirectoryNames
     }
 
     init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        let images = try container.decodeIfPresent(Bool.self, forKey: .images) ?? true
-        let videos = try container.decodeIfPresent(Bool.self, forKey: .videos) ?? true
-        let audio = try container.decodeIfPresent(Bool.self, forKey: .audio) ?? true
+        var container = try decoder.container(keyedBy: CodingKeys.self)
+        var images = try container.decodeIfPresent(Bool.self, forKey: .images) ?? true
+        var videos = try container.decodeIfPresent(Bool.self, forKey: .videos) ?? true
+        var audio = try container.decodeIfPresent(Bool.self, forKey: .audio) ?? true
 
         self.images = images
         self.videos = videos
@@ -52,21 +64,34 @@ struct MediaProcessingPolicy: Codable {
             ?? (videos ? Self.allVideoExtensions : [])
         self.audioExtensions = try container.decodeIfPresent([String].self, forKey: .audioExtensions)
             ?? (audio ? Self.allAudioExtensions : [])
+        self.excludedDirectoryNames = try container.decodeIfPresent([String].self, forKey: .excludedDirectoryNames)
+            ?? Self.defaultExcludedDirectoryNames
     }
 }
 
-struct OptimizationSettings: Codable {
-    let imageOutputFormat: String
-    let imageMaxMegapixels: Double
-    let jpegQuality: Int
-    let videoMaxEdge: Int
-    let audioMinSizeMB: Int
-    let videoAllowCameraMetadataDrop: Bool
+enum SettingsNumberInput {
+    static func decimal(_ text: String) -> Double? {
+        guard let number = Double(text.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: ",", with: ".")),
+              number.isFinite else { return nil }
+        return number
+    }
+}
+
+struct OptimizationSettings: Codable, Equatable {
+    var imageOutputFormat: String
+    var imageMaxMegapixels: Double
+    var jpegQuality: Int
+    var videoMaxEdge: Int
+    var audioMinSizeMB: Int
+    var videoAllowCameraMetadataDrop: Bool
+    var recompressImagesBelowTarget: Bool = true
+    var minimumSavingPercent: Double = 10
+    var minimumSavingMB: Double = 1
 
     static let recommended = OptimizationSettings(
         imageOutputFormat: "jpeg",
-        imageMaxMegapixels: 10,
-        jpegQuality: 50,
+        imageMaxMegapixels: 20,
+        jpegQuality: 70,
         videoMaxEdge: 1280,
         audioMinSizeMB: 10,
         videoAllowCameraMetadataDrop: true
@@ -79,6 +104,120 @@ struct OptimizationSettings: Codable {
         case videoMaxEdge = "video_max_edge"
         case audioMinSizeMB = "audio_min_size_mb"
         case videoAllowCameraMetadataDrop = "video_allow_camera_metadata_drop"
+        case recompressImagesBelowTarget = "recompress_images_below_target"
+        case minimumSavingPercent = "minimum_saving_percent"
+        case minimumSavingMB = "minimum_saving_mb"
+    }
+}
+
+extension OptimizationSettings {
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        imageOutputFormat = try values.decode(String.self, forKey: .imageOutputFormat)
+        imageMaxMegapixels = try values.decode(Double.self, forKey: .imageMaxMegapixels)
+        jpegQuality = try values.decode(Int.self, forKey: .jpegQuality)
+        videoMaxEdge = try values.decode(Int.self, forKey: .videoMaxEdge)
+        audioMinSizeMB = try values.decode(Int.self, forKey: .audioMinSizeMB)
+        videoAllowCameraMetadataDrop = try values.decode(Bool.self, forKey: .videoAllowCameraMetadataDrop)
+        recompressImagesBelowTarget = try values.decodeIfPresent(Bool.self, forKey: .recompressImagesBelowTarget) ?? true
+        minimumSavingPercent = try values.decodeIfPresent(Double.self, forKey: .minimumSavingPercent) ?? 10
+        minimumSavingMB = try values.decodeIfPresent(Double.self, forKey: .minimumSavingMB) ?? 1
+    }
+}
+
+enum FilenameDateStyle {
+    static let choices = [
+        ("YYMMDD-", "230101-photo.jpg"),
+        ("YYYY-MM-DD_", "2023-01-01_photo.jpg"),
+        ("YYYYMMDD-", "20230101-photo.jpg"),
+        ("DD-MM-YYYY_", "01-01-2023_photo.jpg")
+    ]
+    static func isValid(_ style: String) -> Bool {
+        guard (6...32).contains(style.count), let last = style.last, "-_. ".contains(last) else { return false }
+        let regex = try! NSRegularExpression(pattern: "YYYY|YY|MM|DD")
+        let source = style as NSString
+        let matches = regex.matches(in: style, range: NSRange(location: 0, length: source.length))
+        let tokens = matches.map { source.substring(with: $0.range) }
+        let remaining = regex.stringByReplacingMatches(in: style, range: NSRange(location: 0, length: source.length), withTemplate: "")
+        return tokens.count == 3 && tokens.filter { $0 == "YYYY" || $0 == "YY" }.count == 1
+            && tokens.filter { $0 == "MM" }.count == 1 && tokens.filter { $0 == "DD" }.count == 1
+            && remaining.allSatisfy { "-_. ".contains($0) }
+    }
+    static func example(_ style: String) -> String {
+        style.replacingOccurrences(of: "YYYY", with: "2023")
+            .replacingOccurrences(of: "YY", with: "23")
+            .replacingOccurrences(of: "MM", with: "01")
+            .replacingOccurrences(of: "DD", with: "01") + "photo.jpg"
+    }
+}
+
+struct ProcessingRecipe: Codable, Equatable {
+    var mediaProcessing: MediaProcessingPolicy
+    var optimizationSettings: OptimizationSettings
+    var filenamePolicy: FilenamePolicySettings
+    var dateScope: DateScopeSettings
+
+    static let recommended = ProcessingRecipe(
+        mediaProcessing: .recommended, optimizationSettings: .recommended,
+        filenamePolicy: .recommended, dateScope: .recommended
+    )
+
+    enum CodingKeys: String, CodingKey {
+        case mediaProcessing = "media_processing"
+        case optimizationSettings = "optimization_settings"
+        case filenamePolicy = "filename_policy"
+        case dateScope = "date_scope"
+    }
+
+    var summary: String {
+        var parts: [String] = []
+        if mediaProcessing.images {
+            let format = optimizationSettings.imageOutputFormat == "png" ? "PNG" : "JPEG \(optimizationSettings.jpegQuality)"
+            parts.append("Images: \(Int(optimizationSettings.imageMaxMegapixels)) MP · \(format)")
+        }
+        if mediaProcessing.videos { parts.append("Video") }
+        if mediaProcessing.audio { parts.append("Audio") }
+        return parts.isEmpty ? "No media selected" : parts.joined(separator: " · ")
+    }
+}
+
+struct FolderSettings: Codable, Identifiable, Equatable {
+    let folder: String
+    let stateDir: String
+    let recipe: ProcessingRecipe
+    let presetID: String?
+    let presetName: String?
+    let needsAnalysis: Bool
+    var id: String { folder }
+
+    enum CodingKeys: String, CodingKey {
+        case folder, recipe
+        case stateDir = "state_dir"
+        case presetID = "preset_id"
+        case presetName = "preset_name"
+        case needsAnalysis = "needs_analysis"
+    }
+}
+
+struct SettingsPreset: Codable, Identifiable, Equatable {
+    let id: String
+    let name: String
+    let builtIn: Bool
+    let recipe: ProcessingRecipe
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, recipe
+        case builtIn = "built_in"
+    }
+}
+
+struct PresetCatalog: Codable {
+    let presets: [SettingsPreset]
+    let defaultPresetID: String
+
+    enum CodingKeys: String, CodingKey {
+        case presets
+        case defaultPresetID = "default_preset_id"
     }
 }
 
@@ -114,6 +253,74 @@ struct OptimizationPreview: Codable, Identifiable {
     }
 }
 
+struct ScanResultItem: Decodable, Identifiable {
+    let root: String
+    let stateDir: String
+    let relpath: String
+    let operation: String
+    let sourceSize: Int64
+    let reason: String
+    let category: String
+    let detail: String
+    let destination: String?
+    let planPath: String?
+    let embeddedDate: String?
+    let canEditDate: Bool?
+
+    var id: String { root + "|" + relpath }
+    var fileURL: URL {
+        let original = URL(fileURLWithPath: root).appendingPathComponent(relpath)
+        if category == "unchanged", let destination,
+           !FileManager.default.fileExists(atPath: original.path) {
+            let output = URL(fileURLWithPath: root).appendingPathComponent(destination)
+            if FileManager.default.fileExists(atPath: output.path) { return output }
+        }
+        return original
+    }
+    var filename: String { fileURL.lastPathComponent }
+    var dateEditingUnavailableReason: String {
+        if reason == "excluded_directory" {
+            return "Date editing is disabled because this file is in a skipped subfolder."
+        }
+        if operation == "PRESERVE" {
+            return "Date editing is disabled to keep this protected file unchanged."
+        }
+        return "Date editing is not available for this file format."
+    }
+    var actionTitle: String {
+        guard category != "unchanged" else { return "Keep unchanged" }
+        switch operation {
+        case "CONVERT_IMAGE": return "Optimize image"
+        case "CONVERT_VIDEO": return "Optimize video"
+        case "CONVERT_AUDIO": return "Optimize audio"
+        case "RENAME": return "Rename file"
+        case "REVIEW": return "Needs your decision"
+        default: return "Keep unchanged"
+        }
+    }
+    enum CodingKeys: String, CodingKey {
+        case root, relpath, operation, reason, category, detail, destination
+        case stateDir = "state_dir"
+        case sourceSize = "source_size"
+        case planPath = "plan_path"
+        case embeddedDate = "embedded_date"
+        case canEditDate = "can_edit_date"
+    }
+}
+
+struct ScanResultsPage: Decodable {
+    let scanID: String
+    let items: [ScanResultItem]
+    let total: Int
+    let offset: Int
+    let limit: Int
+    let counts: [String: Int]
+    enum CodingKeys: String, CodingKey {
+        case items, total, offset, limit, counts
+        case scanID = "scan_id"
+    }
+}
+
 struct UISnapshot: Codable {
     let version: String
     let configured: Bool
@@ -124,10 +331,16 @@ struct UISnapshot: Codable {
     let archiveAvailable: Bool
     let scanFolders: [String]
     let unavailableScanFolders: [String]
+    let folderSettings: [FolderSettings]?
+    let settingsPresets: [SettingsPreset]?
+    let defaultPresetID: String?
     let activeAssets: Int
     let committedOutputs: Int
+    let optimizedOutputs: Int?
+    let renamedOutputs: Int?
     let rolledBackOutputs: Int
     let totalSavingBytes: Int64
+    let pendingStagedOutputs: Int?
     let quarantineDirectories: Int
     let annual: AnnualScope
     let latestPlan: LatestPlan?
@@ -148,10 +361,16 @@ struct UISnapshot: Codable {
         case archiveAvailable = "archive_available"
         case scanFolders = "scan_folders"
         case unavailableScanFolders = "unavailable_scan_folders"
+        case folderSettings = "folder_settings"
+        case settingsPresets = "settings_presets"
+        case defaultPresetID = "default_preset_id"
         case activeAssets = "active_assets"
         case committedOutputs = "committed_outputs"
+        case optimizedOutputs = "optimized_outputs"
+        case renamedOutputs = "renamed_outputs"
         case rolledBackOutputs = "rolled_back_outputs"
         case totalSavingBytes = "total_saving_bytes"
+        case pendingStagedOutputs = "pending_staged_outputs"
         case quarantineDirectories = "quarantine_directories"
         case latestPlan = "latest_plan"
         case optimizationPreviews = "optimization_previews"
@@ -164,14 +383,20 @@ struct UISnapshot: Codable {
     }
 }
 
-struct DateScopeSettings: Codable {
-    let mode: String
-    let start: String?
-    let end: String?
-    let legacy: Bool
+struct DateScopeSettings: Codable, Equatable {
+    var mode: String
+    var start: String?
+    var end: String?
+    var legacy: Bool
+
+    static let recommended = DateScopeSettings(mode: "older_than_two_years", start: nil, end: nil, legacy: false)
 
     var summary: String {
         switch mode {
+        case "older_than_two_years":
+            return "Older than 2 years"
+        case "legacy":
+            return end.map { "Through \($0)" } ?? "Annual calendar cutoff"
         case "all":
             return "All dates"
         case "within":
@@ -184,10 +409,12 @@ struct DateScopeSettings: Codable {
     }
 }
 
-struct FilenamePolicySettings: Codable {
-    let enabled: Bool
-    let dateFormat: String
-    let maxBytes: Int
+struct FilenamePolicySettings: Codable, Equatable {
+    var enabled: Bool
+    var dateFormat: String
+    var maxBytes: Int
+
+    static let recommended = FilenamePolicySettings(enabled: true, dateFormat: "YYMMDD-", maxBytes: 60)
 
     enum CodingKeys: String, CodingKey {
         case enabled
@@ -218,7 +445,7 @@ struct PreflightStatus: Codable {
             missing.append("Pillow")
         }
 
-        for tool in ["file", "ffprobe", "ffmpeg", "HandBrakeCLI", "xattr"] {
+        for tool in ["file", "ffprobe", "ffmpeg", "HandBrakeCLI", "xattr", "ExifTool", "Perl"] {
             if tools[tool]?.available != true {
                 missing.append(tool)
             }
@@ -306,6 +533,7 @@ struct ReviewItem: Codable, Identifiable {
     }
 
     var category: String {
+        if reason == "embedded_date_missing" { return "Date evidence" }
         if reason.contains("dolby_vision") || reason.contains("hdr_transfer") || reason.contains("wide_gamut") {
             return "Color quality"
         }
@@ -336,6 +564,7 @@ struct ReviewItem: Codable, Identifiable {
     }
 
     var recommendedAction: String {
+        if reason == "embedded_date_missing" { return "Keep the original. Veronica needs a usable date stored inside the file." }
         if category == "Color quality" {
             return "Keep the original unless you are comfortable losing HDR or Dolby Vision behavior."
         }
@@ -352,6 +581,7 @@ struct ReviewItem: Codable, Identifiable {
     }
 
     var title: String {
+        if reason == "embedded_date_missing" { return "No embedded date" }
         if category == "Color quality" { return "HDR or Dolby Vision video" }
         if reason.contains("variable_frame_rate") { return "Video timing may change" }
         if reason.contains("frame_count_mismatch") { return "Video timing is inconsistent" }
@@ -369,6 +599,9 @@ struct ReviewItem: Codable, Identifiable {
     }
 
     var explanation: String {
+        if reason == "embedded_date_missing" {
+            return "This file has no usable embedded date. It stays unchanged until its date can be read from inside the file."
+        }
         if category == "Color quality" {
             return "This video carries HDR, Dolby Vision, or wide-gamut color information. A standard optimization can change how it looks, so Veronica will not transcode it automatically."
         }
@@ -429,6 +662,66 @@ struct RecentChange: Codable, Identifiable {
     }
 }
 
+struct CleanupOutcome {
+    let completed: Bool
+    let optimized: Int
+    let renamed: Int
+    let savedBytes: Int64
+    let unreadable: Int
+    let kept: Int
+
+    var title: String {
+        if !completed { return "Cleanup stopped" }
+        if optimized == 0 && savedBytes == 0 { return "No space saved" }
+        return unreadable > 0 ? "Cleanup finished" : "Cleanup complete"
+    }
+
+    var subtitle: String {
+        if !completed { return "Only the changes shown below were applied. Open cleanup details to see why it stopped." }
+        if unreadable == 1 { return "1 unreadable file was left unchanged. Other verified files were processed." }
+        if unreadable > 1 { return "\(unreadable.formatted()) unreadable files were left unchanged. Other verified files were processed." }
+        if optimized == 0 {
+            return kept > 0 ? "The replacements didn’t save enough space, so your originals were kept."
+                : "No files were compressed. Any filename changes are shown below."
+        }
+        return "Your optimized files are ready in their folders."
+    }
+
+    var formattedSaving: String {
+        savedBytes == 0 ? "0 bytes" : ByteCountFormatter.string(fromByteCount: savedBytes, countStyle: .file)
+    }
+}
+
+struct AnalysisProgress: Decodable {
+    let phase: String
+    let folder: String
+    let folderIndex: Int
+    let folderCount: Int
+    let completedFiles: Int
+    let totalFiles: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case phase, folder
+        case folderIndex = "folder_index"
+        case folderCount = "folder_count"
+        case completedFiles = "completed_files"
+        case totalFiles = "total_files"
+    }
+
+    var fractionCompleted: Double? {
+        guard phase == "scanning", let totalFiles, totalFiles > 0 else { return nil }
+        return min(max(Double(completedFiles) / Double(totalFiles), 0), 1)
+    }
+
+    var title: String {
+        switch phase {
+        case "discovering": return "Counting files"
+        case "scanning": return "Scanning your folder"
+        default: return "Preparing your results"
+        }
+    }
+}
+
 struct EngineEvent: Codable, Identifiable {
     let id = UUID()
     let event: String
@@ -471,6 +764,7 @@ struct EngineEvent: Codable, Identifiable {
         case "stage_item":
             if status == "STAGED_VERIFIED" { return "Verified replacement" }
             if status == "KEEP_ORIGINAL" { return "Keeping original" }
+            if status == "SOURCE_UNREADABLE" { return "Unreadable file left unchanged" }
             if status == "FAILED" { return "Verification failed" }
             return "Staging media"
         case "commit_item": return "Committed verified replacement"

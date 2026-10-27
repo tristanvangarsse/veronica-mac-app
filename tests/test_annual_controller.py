@@ -30,11 +30,11 @@ def main() -> int:
     script = project / "media_maintenance.py"
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
-        # Calendar-year annual policy: a run in year Y includes through Dec 31 of Y-2.
-        run_case(script, project, base, "2026-09-22", "2025-01-01")
-        run_case(script, project, base, "2027-01-02", "2026-01-01")
-        run_case(script, project, base, "2027-02-05", "2026-01-01")
-    print("annual controller calendar-cutoff integration: PASS")
+        # The manual age rule advances with the run date, including on leap years.
+        run_case(script, project, base, "2026-09-22", "2024-09-22")
+        run_case(script, project, base, "2027-01-02", "2025-01-02")
+        run_case(script, project, base, "2027-02-05", "2025-02-05")
+    print("annual controller two-year-cutoff integration: PASS")
     return 0
 
 

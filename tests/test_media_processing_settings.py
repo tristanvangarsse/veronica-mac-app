@@ -15,7 +15,7 @@ ENGINE = ROOT / "media_maintenance.py"
 
 def run(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["python3", str(ENGINE), *args],
+        [sys.executable, str(ENGINE), *args],
         cwd=ROOT,
         check=True,
         capture_output=True,
@@ -55,6 +55,7 @@ with tempfile.TemporaryDirectory(prefix="veronica-media-processing-settings-") a
         "image_extensions": [],
         "video_extensions": expected_video_extensions,
         "audio_extensions": [],
+        "excluded_directory_names": list(mm.audit.DEFAULT_EXCLUDED_DIRECTORY_NAMES),
     }, saved
 
     settings = json.loads((state / "settings.json").read_text())
@@ -77,6 +78,7 @@ with tempfile.TemporaryDirectory(prefix="veronica-media-processing-settings-") a
         "image_extensions": [],
         "video_extensions": expected_video_extensions,
         "audio_extensions": [],
+        "excluded_directory_names": list(mm.audit.DEFAULT_EXCLUDED_DIRECTORY_NAMES),
     }, payload["media_processing"]
 
     # Planner hard-boundary behavior. Use synthetic planner rows so this test
@@ -181,18 +183,17 @@ with tempfile.TemporaryDirectory(prefix="veronica-media-processing-settings-") a
     assert document_item["reason"] == "unclassified_content:unknown", document_item
     assert "final_relpath" not in document_item["target"], document_item
 
-    # Date-only review should not block optimization when the user is
-    # maintaining all dates. It should only suppress date-based renaming.
+    # A missing embedded date blocks optimization even under All dates.
     uncertain_date_row = {
         "relpath": "ambiguous-date-photo.jpg",
         "detected_kind": "image",
         "tags": [],
         "action": "REVIEW",
-        "reason": "date_low_confidence",
+        "reason": "embedded_date_missing",
         "quick_hash": "uncertain-date-hash",
         "size": 5_000_000,
         "mtime_ts": 1,
-        "best_date": "2024-01-02",
+        "best_date": None,
         "megapixels": 24.0,
         "animated": False,
         "extension": ".jpg",
@@ -203,16 +204,17 @@ with tempfile.TemporaryDirectory(prefix="veronica-media-processing-settings-") a
     all_dates_cfg["streams_image_max_megapixels"] = 10
     all_dates_cfg["filename_standardization_enabled"] = True
 
-    assert mm.should_auto_optimize_date_review(uncertain_date_row, all_dates_cfg)
+    assert not mm.should_auto_optimize_date_review(uncertain_date_row, all_dates_cfg)
     date_item = mm.make_item(
-        {**uncertain_date_row, "action": "CANDIDATE"},
+        uncertain_date_row,
         101,
         all_dates_cfg,
     )
     filename_row = {**uncertain_date_row, "best_date": None}
     date_item = mm.apply_filename_policy(date_item, filename_row, all_dates_cfg)
 
-    assert date_item["operation"] == "CONVERT_IMAGE", date_item
+    assert date_item["operation"] == "REVIEW", date_item
+    assert date_item["reason"] == "embedded_date_missing", date_item
     assert "final_relpath" not in date_item["target"], date_item
 
     ranged_cfg = json.loads(json.dumps(all_dates_cfg))
@@ -267,6 +269,7 @@ with tempfile.TemporaryDirectory(prefix="veronica-media-processing-settings-") a
         "scan_folders": [str(optimization_media)],
         "image_output_format": "png",
         "image_max_megapixels": 4.0,
+        "photo_library_max_megapixels": 18.0,
         "jpeg_quality": 82,
         "video_max_edge": 1080,
         "audio_min_size_mb": 42,
@@ -283,6 +286,7 @@ with tempfile.TemporaryDirectory(prefix="veronica-media-processing-settings-") a
 
     assert optimization_child_settings["image_output_format"] == "png"
     assert optimization_child_settings["image_max_megapixels"] == 4.0
+    assert "photo_library_max_megapixels" not in optimization_child_settings
     assert optimization_child_settings["jpeg_quality"] == 82
     assert optimization_child_settings["video_max_edge"] == 1080
     assert optimization_child_settings["audio_min_size_mb"] == 42
@@ -300,6 +304,9 @@ with tempfile.TemporaryDirectory(prefix="veronica-media-processing-settings-") a
         "image_max_megapixels": 4.0,
         "jpeg_quality": 82,
         "video_max_edge": 1080,
+        "recompress_images_below_target": True,
+        "minimum_saving_percent": 10.0,
+        "minimum_saving_mb": 1.0,
         "audio_min_size_mb": 42,
         "video_allow_camera_metadata_drop": False,
     }, effective_optimization
@@ -358,6 +365,7 @@ with tempfile.TemporaryDirectory(prefix="veronica-media-processing-settings-") a
         "image_extensions": [],
         "video_extensions": [".mov", ".mp4"],
         "audio_extensions": [],
+        "excluded_directory_names": list(mm.audit.DEFAULT_EXCLUDED_DIRECTORY_NAMES),
     }, effective
 
 print("media processing settings regression: PASS")

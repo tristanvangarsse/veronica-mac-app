@@ -73,6 +73,7 @@ with tempfile.TemporaryDirectory(prefix="veronica-audio-rollback-") as td:
             "150",
             "-c:a",
             "pcm_s16le",
+            "-metadata", "date=2023-01-15",
             str(source),
         ],
         check=True,
@@ -91,7 +92,7 @@ with tempfile.TemporaryDirectory(prefix="veronica-audio-rollback-") as td:
         str(media),
     )
 
-    # Initial plan should require a human date resolution for this synthetic file.
+    # The embedded recording date makes this synthetic audio eligible directly.
     run(
         "plan",
         "--root",
@@ -108,25 +109,10 @@ with tempfile.TemporaryDirectory(prefix="veronica-audio-rollback-") as td:
         i for i in first_data["items"] if i["relpath"] == source.name
     )
 
-    assert first_item["operation"] == "REVIEW", first_item
-    assert "date_low_confidence" in first_item["reason"], first_item
+    assert first_item["operation"] == "CONVERT_AUDIO", first_item
+    assert first_item["target"]["filename_date"] == "2023-01-15"
 
-    run(
-        "resolve-review",
-        "--plan",
-        str(first_plan),
-        "--state-dir",
-        str(state),
-        "--relpath",
-        source.name,
-        "--resolution",
-        "PROCESS_NORMALLY",
-        "--note",
-        "Automated regression fixture",
-        "--yes",
-    )
-
-    # Re-plan after review resolution.
+    # Re-planning uses the same embedded date without requiring an override.
     run(
         "plan",
         "--root",
@@ -202,6 +188,9 @@ with tempfile.TemporaryDirectory(prefix="veronica-audio-rollback-") as td:
     assert "COMMITTED:" in commit.stdout
     assert not source.exists()
     assert expected_final.is_file()
+    probe = subprocess.run(["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(expected_final)], capture_output=True, text=True, check=True)
+    stream = json.loads(probe.stdout)["streams"][0]
+    assert stream["codec_name"] == "mp3" and stream["channels"] == 2 and stream["sample_rate"] == "44100", stream
 
     con = sqlite3.connect(state / "media-maintenance.sqlite")
     row = con.execute(

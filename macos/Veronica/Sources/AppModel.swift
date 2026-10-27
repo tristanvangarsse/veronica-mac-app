@@ -7,21 +7,25 @@ final class AppModel: ObservableObject {
     @Published var snapshot: UISnapshot?
     @Published var isLoading = false
 
-    // A cached snapshot may be displayed immediately at launch, but only a
-    // snapshot fetched successfully during this app session is considered
-    // live enough to authorize maintenance.
+    // File lists and scan decisions exist only for this launch.
     @Published private(set) var hasLiveSnapshot = false
 
     @Published var isRunningAnnual = false
     @Published var isAnalyzing = false
+    @Published private(set) var isCancellingAnalysis = false
+    @Published private(set) var analysisCancelled = false
+    @Published private(set) var isSavingSettings = false
+    @Published private(set) var isSavingFileDate = false
     @Published var analysisCompleted = false
+    @Published private(set) var cleanupCompleted = false
+    @Published private(set) var cleanupOutcome: CleanupOutcome?
     @Published var analysisActivity = ""
+    @Published private(set) var analysisProgress: AnalysisProgress?
     @Published var errorMessage: String?
+    @Published private(set) var maintenanceFailure: String?
     @Published var activityLines: [String] = []
     @Published var events: [EngineEvent] = []
     @Published var developerMode = DiagnosticsCenter.shared.developerMode
-    @Published var notificationsEnabled = NotificationManager.shared.isEnabled
-    @Published var notificationStatus = NotificationManager.shared.statusLabel
 
     // Immediate UI state for the media-processing toggles.
     // The engine remains the durable source of truth; refresh() reconciles these.
@@ -37,124 +41,7 @@ final class AppModel: ObservableObject {
     // coalesced and persisted serially so a slow engine write never drops a
     // later click.
     private var mediaProcessingSaveRequested = false
-
-    private let snapshotCacheURL: URL
-    private let notifications = NotificationManager.shared
-
-    init() {
-        let fm = FileManager.default
-        let appSupport = fm.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first ?? fm.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support", isDirectory: true)
-
-#if DEBUG
-        let directory: URL
-        if let stateDir = ProcessInfo.processInfo.environment["VERONICA_STATE_DIR"],
-           !stateDir.isEmpty {
-            directory = URL(fileURLWithPath: stateDir, isDirectory: true)
-        } else {
-            directory = appSupport
-                .appendingPathComponent("Veronica", isDirectory: true)
-        }
-#else
-        let directory = appSupport
-            .appendingPathComponent("Veronica", isDirectory: true)
-#endif
-
-        snapshotCacheURL = directory
-            .appendingPathComponent("ui-snapshot-cache.json")
-
-        loadCachedSnapshot()
-    }
-
-    func prepareNotifications() async {
-        await notifications.prepare()
-        syncNotificationState()
-    }
-
-    func setNotificationsEnabled(_ enabled: Bool) {
-        notificationsEnabled = enabled
-        Task { @MainActor in
-            await notifications.setEnabled(enabled)
-            syncNotificationState()
-        }
-    }
-
-    func requestNotificationPermission() {
-        Task { @MainActor in
-            await notifications.requestAuthorizationIfNeeded()
-            syncNotificationState()
-        }
-    }
-
-    func sendTestNotification() {
-        Task { @MainActor in
-            await notifications.notify(
-                title: "Veronica notifications are working",
-                body: "You will see messages when analysis or optimization finishes.",
-                identifier: "settings-test-\(UUID().uuidString)"
-            )
-            syncNotificationState()
-        }
-    }
-
-    func openNotificationSettings() {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") {
-            NSWorkspace.shared.open(url)
-        }
-    }
-
-    private func syncNotificationState() {
-        notificationsEnabled = notifications.isEnabled
-        notificationStatus = notifications.statusLabel
-    }
-
-    private func loadCachedSnapshot() {
-        do {
-            let data = try Data(contentsOf: snapshotCacheURL)
-            let cached = try JSONDecoder().decode(UISnapshot.self, from: data)
-
-            snapshot = cached
-            syncMediaProcessingState(cached.mediaProcessing)
-
-            DiagnosticsCenter.shared.log(
-                "INFO",
-                "App",
-                "Loaded cached UI snapshot"
-            )
-        } catch {
-            // A missing, outdated, or corrupt cache is equivalent to having no
-            // cache. The normal live refresh will populate state shortly.
-            snapshot = nil
-        }
-    }
-
-    private func cacheSnapshot(_ snapshot: UISnapshot) {
-        do {
-            let directory = snapshotCacheURL.deletingLastPathComponent()
-
-            try FileManager.default.createDirectory(
-                at: directory,
-                withIntermediateDirectories: true
-            )
-
-            let encoder = JSONEncoder()
-            let data = try encoder.encode(snapshot)
-
-            try data.write(
-                to: snapshotCacheURL,
-                options: .atomic
-            )
-        } catch {
-            DiagnosticsCenter.shared.log(
-                "ERROR",
-                "App",
-                "Could not cache UI snapshot: \(error.localizedDescription)"
-            )
-        }
-    }
+    private var analysisTask: Task<Void, Error>?
 
     @discardableResult
     private func requireLiveSnapshot() -> Bool {
@@ -197,6 +84,7 @@ final class AppModel: ObservableObject {
         }
 
         do {
+            try await EngineRunner.shared.prepareForLaunch()
             let refreshed = try await EngineRunner.shared.snapshot()
 
             snapshot = refreshed
@@ -204,13 +92,11 @@ final class AppModel: ObservableObject {
 
             syncMediaProcessingState(refreshed.mediaProcessing)
 
-            cacheSnapshot(refreshed)
-
             let missing = refreshed.preflight.missingRequirements
             if missing.isEmpty {
                 errorMessage = nil
             } else {
-                errorMessage = "Veronica is missing required dependencies: \(missing.joined(separator: ", ")). Install them, then refresh or relaunch Veronica. Maintenance will remain disabled until they are available."
+                errorMessage = "Veronica could not load some built-in components. Reinstall the complete Veronica app, then reopen it. Your files have not been changed."
             }
         } catch {
             errorMessage = error.localizedDescription
@@ -314,6 +200,68 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func performSettingsUpdate(
+        invalidatesAnalysis: Bool,
+        operation: () async throws -> Void
+    ) async throws {
+        guard hasLiveSnapshot else {
+            throw EngineRunnerError.operationUnavailable("Wait for Veronica to finish refreshing, then try again.")
+        }
+        guard !isAnalyzing && !isRunningAnnual && !isSavingSettings && !isSavingFileDate else {
+            throw EngineRunnerError.operationUnavailable("Wait for the current operation to finish before changing settings.")
+        }
+        isSavingSettings = true
+        defer { isSavingSettings = false }
+        do {
+            try await operation()
+            if invalidatesAnalysis {
+                analysisCompleted = false
+                analysisActivity = "Folder settings changed. Analyze again before optimizing."
+            }
+            await refresh()
+            guard hasLiveSnapshot else {
+                throw EngineRunnerError.operationUnavailable("Settings were saved, but Veronica could not reload them. Refresh before continuing.")
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+            throw error
+        }
+    }
+
+    func saveFolderSettings(folder: String, recipe: ProcessingRecipe) async throws {
+        try await performSettingsUpdate(invalidatesAnalysis: true) {
+            try await EngineRunner.shared.saveFolderSettings(folder: folder, recipe: recipe)
+        }
+    }
+
+    func applyPreset(folder: String, presetID: String) async throws {
+        try await performSettingsUpdate(invalidatesAnalysis: true) {
+            try await EngineRunner.shared.applyPreset(folder: folder, presetID: presetID)
+        }
+    }
+
+    @discardableResult
+    func savePreset(name: String, recipe: ProcessingRecipe, presetID: String? = nil) async throws -> SettingsPreset {
+        var saved: SettingsPreset?
+        try await performSettingsUpdate(invalidatesAnalysis: false) {
+            saved = try await EngineRunner.shared.savePreset(name: name, recipe: recipe, presetID: presetID)
+        }
+        guard let saved else { throw EngineRunnerError.operationUnavailable("The preset could not be saved. Try again.") }
+        return saved
+    }
+
+    func deletePreset(presetID: String) async throws {
+        try await performSettingsUpdate(invalidatesAnalysis: false) {
+            try await EngineRunner.shared.deletePreset(presetID: presetID)
+        }
+    }
+
+    func setDefaultPreset(presetID: String) async throws {
+        try await performSettingsUpdate(invalidatesAnalysis: false) {
+            try await EngineRunner.shared.setDefaultPreset(presetID: presetID)
+        }
+    }
+
     func updateFilenamePolicy(
         enabled: Bool? = nil,
         dateFormat: String? = nil,
@@ -368,17 +316,8 @@ final class AppModel: ObservableObject {
 
     func restoreRecommendedOptimizationSettings() async {
         guard requireLiveSnapshot() else { return }
-        let recommended = OptimizationSettings.recommended
-
         do {
-            try await EngineRunner.shared.configureOptimization(
-                imageFormat: recommended.imageOutputFormat,
-                imageMaxMegapixels: recommended.imageMaxMegapixels,
-                jpegQuality: recommended.jpegQuality,
-                videoMaxEdge: recommended.videoMaxEdge,
-                audioMinSizeMB: recommended.audioMinSizeMB,
-                videoAllowCameraMetadataDrop: recommended.videoAllowCameraMetadataDrop
-            )
+            try await EngineRunner.shared.restoreManualDefaults()
             analysisCompleted = false
             await refresh()
         } catch {
@@ -428,7 +367,7 @@ final class AppModel: ObservableObject {
 
     func addScanFolderURLs(_ urls: [URL]) async {
         guard requireLiveSnapshot() else { return }
-        guard !isAnalyzing && !isRunningAnnual else {
+        guard !isAnalyzing && !isRunningAnnual && !isSavingSettings && !isSavingFileDate else {
             errorMessage = "Wait for the current operation to finish before adding folders."
             return
         }
@@ -456,10 +395,6 @@ final class AppModel: ObservableObject {
             try await EngineRunner.shared.addScanFolders(paths)
             analysisCompleted = false
             await refresh()
-
-            if hasLiveSnapshot {
-                await analyzeLibrary()
-            }
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -467,15 +402,12 @@ final class AppModel: ObservableObject {
 
     func removeScanFolder(_ path: String) async {
         guard requireLiveSnapshot() else { return }
+        guard !isAnalyzing && !isRunningAnnual && !isSavingSettings && !isSavingFileDate else { return }
 
         do {
             try await EngineRunner.shared.removeScanFolder(path)
             analysisCompleted = false
             await refresh()
-
-            if hasLiveSnapshot && snapshot?.configured == true {
-                await analyzeLibrary()
-            }
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -483,107 +415,139 @@ final class AppModel: ObservableObject {
 
     func analyzeLibrary() async {
         guard requireLiveSnapshot() else { return }
-        guard !isAnalyzing && !isRunningAnnual else { return }
+        guard !isAnalyzing && !isRunningAnnual && !isSavingSettings && !isSavingFileDate else { return }
 
         guard snapshot?.configured == true,
               snapshot?.archiveAvailable == true else {
             let message = "Choose an available folder before analyzing."
             errorMessage = message
-            await notifications.notify(
-                title: "Veronica analysis stopped",
-                body: message,
-                identifier: "analysis-not-ready"
-            )
             return
         }
 
         isAnalyzing = true
+        cleanupOutcome = nil
+        isCancellingAnalysis = false
+        analysisCancelled = false
         analysisCompleted = false
+        cleanupCompleted = false
         analysisActivity = "Preparing analysis…"
+        analysisProgress = nil
         errorMessage = nil
 
-        defer { isAnalyzing = false }
+        let progressURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("veronica-analysis-\(UUID().uuidString).jsonl")
+        let pollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                self?.loadAnalysisProgress(from: progressURL)
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
+
+        defer {
+            pollTask.cancel()
+            try? FileManager.default.removeItem(at: progressURL)
+            isAnalyzing = false
+            isCancellingAnalysis = false
+            analysisTask = nil
+            analysisProgress = nil
+        }
 
         do {
-            try await EngineRunner.shared.analyzeAll { chunk in
-                Task { @MainActor in
-                    let lines = chunk.split(
-                        separator: "\n",
-                        omittingEmptySubsequences: true
-                    )
-                    if let last = lines.last {
-                        self.analysisActivity = String(last)
+            let task = Task {
+                try await EngineRunner.shared.analyzeAll(eventsURL: progressURL) { chunk in
+                    Task { @MainActor in
+                        guard self.isAnalyzing && !self.isCancellingAnalysis else { return }
+                        let lines = chunk.split(separator: "\n", omittingEmptySubsequences: true)
+                        if let last = lines.last {
+                            self.analysisActivity = String(last)
+                        }
                     }
                 }
             }
+            analysisTask = task
+            try await withTaskCancellationHandler(operation: {
+                try await task.value
+            }, onCancel: { task.cancel() })
+            try Task.checkCancellation()
+            guard !isCancellingAnalysis else { throw CancellationError() }
             await refresh()
+            guard !isCancellingAnalysis else { throw CancellationError() }
             guard hasLiveSnapshot else {
                 analysisActivity = "Analysis completed, but results could not be loaded"
                 return
             }
             analysisCompleted = true
             analysisActivity = "Analysis complete"
-            let readyCount = snapshot?.latestPlan?.remainingExecutableCount
-                ?? snapshot?.latestPlan?.executableCount
-                ?? 0
-            let reviewCount = snapshot?.unresolvedReviews.count ?? 0
-            await notifications.notify(
-                title: "Veronica analysis complete",
-                body: "\(readyCount) ready action(s), \(reviewCount) item(s) needing review.",
-                identifier: "analysis-complete"
-            )
+            if (snapshot?.pendingStagedOutputs ?? 0) == 0 {
+                maintenanceFailure = nil
+            }
         } catch {
-            errorMessage = error.localizedDescription
-            analysisActivity = "Analysis could not be completed"
-            await notifications.notify(
-                title: "Veronica analysis stopped",
-                body: error.localizedDescription,
-                identifier: "analysis-failed"
-            )
+            if error is CancellationError || isCancellingAnalysis {
+                analysisCancelled = true
+                analysisActivity = "Scan cancelled"
+                await refresh()
+            } else {
+                errorMessage = error.localizedDescription
+                analysisActivity = "Analysis could not be completed"
+            }
+        }
+    }
+
+    func cancelAnalysis() {
+        guard isAnalyzing && !isCancellingAnalysis else { return }
+        isCancellingAnalysis = true
+        analysisActivity = "Cancelling scan…"
+        analysisTask?.cancel()
+    }
+
+    private func loadAnalysisProgress(from url: URL) {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return }
+        // The writer may still be appending its final line. Use the newest
+        // complete record so a partial write never resets visible progress.
+        for line in text.split(separator: "\n").reversed() {
+            if let progress = try? JSONDecoder().decode(AnalysisProgress.self, from: Data(line.utf8)) {
+                analysisProgress = progress
+                return
+            }
         }
     }
 
     func runAnnual() async {
         guard requireLiveSnapshot() else { return }
+        guard !isSavingSettings && !isSavingFileDate && !isAnalyzing && analysisCompleted else { return }
 
         guard !isRunningAnnual else { return }
+
+        guard (snapshot?.pendingStagedOutputs ?? 0) == 0 else {
+            maintenanceFailure = "Verified replacements from the previous run are still staged. Inspect the run details before starting another optimization."
+            return
+        }
 
         guard snapshot?.configured == true else {
             let message = "Add at least one folder before running maintenance."
             errorMessage = message
-            await notifications.notify(
-                title: "Veronica optimization stopped",
-                body: message,
-                identifier: "maintenance-not-configured"
-            )
             return
         }
         guard snapshot?.archiveAvailable == true else {
             let message = "One or more configured folders are currently unavailable."
             errorMessage = message
-            await notifications.notify(
-                title: "Veronica optimization stopped",
-                body: message,
-                identifier: "maintenance-folder-unavailable"
-            )
             return
         }
 
         guard snapshot?.preflight.requiredToolsReady == true else {
             let message = "Veronica is missing one or more required media tools. Open Settings to see what is unavailable."
             errorMessage = message
-            await notifications.notify(
-                title: "Veronica optimization stopped",
-                body: message,
-                identifier: "maintenance-tools-unavailable"
-            )
             return
         }
 
         isRunningAnnual = true
+        let beforeCleanup = snapshot
+        cleanupOutcome = nil
+        cleanupCompleted = false
         activityLines = []
         events = []
         errorMessage = nil
+        maintenanceFailure = nil
 
         let eventURL = FileManager.default.temporaryDirectory.appendingPathComponent("veronica-events-\(UUID().uuidString).jsonl")
         let pollTask = Task { [weak self] in
@@ -608,38 +572,29 @@ final class AppModel: ObservableObject {
                 }
             }
             loadEvents(from: eventURL)
+            try await EngineRunner.shared.moveCompletedOriginalsToTrash()
             if result.exitCode != 0 {
-                errorMessage = "Maintenance stopped safely. Review the Activity and Review screens for details."
-                await notifications.notify(
-                    title: "Veronica stopped safely",
-                    body: "Review Activity and Review Details before continuing.",
-                    identifier: "maintenance-stopped"
-                )
-            } else {
-                await refresh()
-                let saved = snapshot.map {
-                    ByteCountFormatter.string(
-                        fromByteCount: $0.totalSavingBytes,
-                        countStyle: .file
-                    )
-                } ?? "space"
-                let reviewCount = snapshot?.unresolvedReviews.count ?? 0
-                await notifications.notify(
-                    title: "Veronica optimization complete",
-                    body: "Saved \(saved). \(reviewCount) item(s) still need review.",
-                    identifier: "maintenance-complete"
-                )
-                return
+                maintenanceFailure = "Cleanup stopped. Some files may already be optimized; their originals are in the Mac Trash. Open cleanup details for the reason."
             }
             await refresh()
+            cleanupCompleted = result.exitCode == 0 && hasLiveSnapshot
         } catch {
-            errorMessage = error.localizedDescription
-            await notifications.notify(
-                title: "Veronica optimization stopped",
-                body: error.localizedDescription,
-                identifier: "maintenance-failed"
-            )
+            maintenanceFailure = error.localizedDescription
+            await refresh()
         }
+        cleanupOutcome = CleanupOutcome(
+            completed: cleanupCompleted,
+            optimized: max(0, (snapshot?.optimizedOutputs ?? 0) - (beforeCleanup?.optimizedOutputs ?? 0)),
+            renamed: max(0, (snapshot?.renamedOutputs ?? 0) - (beforeCleanup?.renamedOutputs ?? 0)),
+            savedBytes: max(0, (snapshot?.totalSavingBytes ?? 0) - (beforeCleanup?.totalSavingBytes ?? 0)),
+            unreadable: events.filter { $0.event == "stage_item" && $0.status == "SOURCE_UNREADABLE" }.count,
+            kept: events.filter { $0.event == "stage_item" && $0.status == "KEEP_ORIGINAL" }.count
+        )
+    }
+
+    func dismissError() {
+        errorMessage = nil
+        maintenanceFailure = nil
     }
 
     private func loadEvents(from url: URL) {
@@ -651,6 +606,33 @@ final class AppModel: ObservableObject {
             return try? decoder.decode(EngineEvent.self, from: d)
         }
         if !decoded.isEmpty { events = decoded }
+    }
+
+    func saveFileDate(_ item: ScanResultItem, date: String) async throws -> String {
+        guard hasLiveSnapshot, !isAnalyzing, !isRunningAnnual, !isSavingSettings, !isSavingFileDate,
+              item.canEditDate == true, let plan = item.planPath else {
+            throw EngineRunnerError.operationUnavailable("Wait for the current operation to finish, then open this file again.")
+        }
+        isSavingFileDate = true
+        defer { isSavingFileDate = false }
+        let result = try await EngineRunner.shared.run([
+            "set-file-date", "--state-dir", item.stateDir, "--plan", plan,
+            "--relpath", item.relpath, "--date", date, "--yes"
+        ])
+        guard result.exitCode == 0 else {
+            throw EngineRunnerError.operationUnavailable(result.stderr.isEmpty ? result.stdout : result.stderr)
+        }
+        let response = try JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any]
+        cleanupCompleted = false
+        cleanupOutcome = nil
+        do {
+            try await EngineRunner.shared.moveCompletedOriginalsToTrash()
+        } catch {
+            await refresh()
+            throw EngineRunnerError.operationUnavailable("The date was saved. Veronica has kept the original safely, but could not move it to Trash: \(error.localizedDescription)")
+        }
+        await refresh()
+        return response?["relpath"] as? String ?? item.relpath
     }
 
     func keepAsIs(_ item: ReviewItem) async {
@@ -758,6 +740,15 @@ final class AppModel: ObservableObject {
             FileManager.default.createFile(atPath: url.path, contents: Data())
         }
         NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    func revealChangeLogs() {
+        let directory = EngineRunner.shared.preferencesDirectory.appendingPathComponent("Change Logs", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            NSWorkspace.shared.open(directory)
+        } catch { errorMessage = "The change log folder could not be opened: \(error.localizedDescription)" }
     }
 
     func revealStateDirectory() {

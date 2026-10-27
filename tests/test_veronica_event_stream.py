@@ -29,7 +29,7 @@ def main() -> int:
         assert "plan_complete" in names
         assert names[-1] == "annual_complete"
         cutoff = next(row for row in rows if row["event"] == "annual_cutoff")
-        assert cutoff["cutoff"] == "2026-01-01"
+        assert cutoff["cutoff"] == "2025-01-03"
         complete = rows[-1]
         assert Path(complete["report"]).exists()
 

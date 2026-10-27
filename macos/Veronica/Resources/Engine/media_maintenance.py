@@ -18,7 +18,9 @@ It verifies immutable-plan source identity before staging and validates staged o
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
+import fcntl
 import datetime as dt
 import hashlib
 import math
@@ -33,13 +35,16 @@ import subprocess
 import tempfile
 import time
 import sys
+import unicodedata
 from collections import Counter
 from pathlib import Path
 from typing import Any, Optional
 
 import media_audit as audit
+import media_security as security
+import media_change_log
 
-VERSION = "0.13.5"
+VERSION = "0.16.0"
 SCHEMA_VERSION = 9
 PRODUCT_NAME = "Veronica"
 DEFAULT_STATE_DIR = "~/Library/Application Support/Veronica"
@@ -54,14 +59,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "legacy_v2_tags": ["compressed-v2", "_compressed-v2"],
     "personal_tags_exclude": ["compressed-v1", "compressed-v2", "_compressed-v2", "temp-1", "temp-2"],
     "video_preset_file": "preset-720P.json",
-    "streams_jpeg_quality": 50,
+    "image_max_megapixels": 20,
+    "jpeg_quality": 70,
+    "streams_jpeg_quality": 70,
     "photo_library_jpeg_quality": 70,
     "minimum_saving_percent": 10.0,
     "minimum_saving_bytes": 1048576,
     "stage_copy_personal_finder_tags": True,
+    "recompress_images_below_target": True,
     "filename_standardization_enabled": True,
-    "filename_date_format": "YYYY-MM-DD_",
-    "filename_max_bytes": 180,
+    "filename_date_format": "YYMMDD-",
+    "filename_max_bytes": 60,
     "require_creation_date_before_commit": True,
     "creation_time_tolerance_seconds": 1.0,
     "video_aspect_ratio_tolerance": 0.005,
@@ -78,7 +86,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "video_vfr_cfr_like_max_p95_p05_spread": 1.05,
     "video_review_multichannel_audio": True,
     "policies": {
-        "streams_image": "streams-image-10mp-v1",
+        "image": "image-folder-recipe-v2",
+        "streams_image": "image-folder-recipe-v2",
         "photo_library_image": "photo-library-image-20mp-v1",
         "streams_video": "streams-video-handbrake-square-pixel-720p-v4-no-autocrop",
         "streams_audio": "streams-audio-mp3-128k-v1",
@@ -136,20 +145,38 @@ def load_product_settings(state_dir: Path) -> dict[str, Any]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
         raise RuntimeError(f"invalid_veronica_settings:{exc}")
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    # Clear only the old automatically supplied exclusion list. Recipes saved
+    # with the new controls retain even that exact list if a user chooses it.
+    old_defaults = ["RAW", "Capture", "CaptureOne", "Photoshop", "Original", "Retouch", "Assets", "Unused", "Masters", "Master", "Source", "Working", "Negatives"]
+    def clear_old_exclusions(recipe):
+        if isinstance(recipe, dict) and "recompress_images_below_target" not in recipe.get("optimization_settings", {}):
+            media = recipe.get("media_processing", {})
+            if media.get("excluded_directory_names") == old_defaults:
+                media["excluded_directory_names"] = []
+    clear_old_exclusions(data.get("folder_recipe"))
+    for preset in data.get("settings_presets", []) or []:
+        if isinstance(preset, dict): clear_old_exclusions(preset.get("recipe"))
+    if "recompress_images_below_target" not in data and data.get("excluded_directory_names") == old_defaults:
+        data["excluded_directory_names"] = []
+    return data
 
 
 def save_product_settings(state_dir: Path, data: dict[str, Any]) -> None:
-    state_dir.mkdir(parents=True, exist_ok=True)
-    path = settings_path(state_dir)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(str(tmp), str(path))
+    state_dir = state_dir.expanduser().resolve()
+    security.atomic_json(security.inside(state_dir, SETTINGS_FILENAME), data)
 
 
-def filename_product_settings(state_dir: Path) -> dict[str, Any]:
-    """Return validated effective filename settings for the native app."""
+def processing_product_settings(state_dir: Path) -> dict[str, Any]:
     saved = load_product_settings(state_dir)
+    recipe = saved.get("folder_recipe")
+    return {**saved, **recipe_flat_settings(recipe)} if isinstance(recipe, dict) else saved
+
+
+def filename_product_settings(state_dir: Path, saved_override: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Return validated effective filename settings for the native app."""
+    saved = processing_product_settings(state_dir) if saved_override is None else saved_override
 
     enabled = saved.get(
         "filename_standardization_enabled",
@@ -165,9 +192,9 @@ def filename_product_settings(state_dir: Path) -> dict[str, Any]:
     )
 
     enabled = bool(enabled)
-    date_format = str(date_format or "YYYY-MM-DD_")
-    if date_format not in _SUPPORTED_FILENAME_DATE_FORMATS:
-        date_format = "YYYY-MM-DD_"
+    date_format = str(date_format or DEFAULT_CONFIG["filename_date_format"])
+    if not valid_filename_date_format(date_format):
+        date_format = DEFAULT_CONFIG["filename_date_format"]
 
     try:
         max_bytes = int(max_bytes)
@@ -196,16 +223,17 @@ def apply_product_filename_settings(cfg: dict[str, Any], state_dir: Path) -> dic
 def date_scope_product_settings(
     state_dir: Path,
     run_date: Optional[dt.date] = None,
+    saved_override: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Return the validated effective date-scope policy.
 
-    The annual calendar policy is the product default. Explicit saved
+    The manual two-year age policy is the product default. Explicit saved
     settings may opt into all, within, or outside date scopes.
     """
-    saved = load_product_settings(state_dir)
-    mode = str(saved.get("date_scope_mode") or "legacy")
+    saved = processing_product_settings(state_dir) if saved_override is None else saved_override
+    mode = str(saved.get("date_scope_mode") or "older_than_two_years")
 
-    if mode not in {"legacy", "all", "within", "outside"}:
+    if mode not in {"older_than_two_years", "legacy", "all", "within", "outside"}:
         mode = "all"
 
     start = saved.get("date_scope_start")
@@ -227,6 +255,10 @@ def date_scope_product_settings(
             else:
                 start = start_date.isoformat()
                 end = end_date.isoformat()
+
+    if mode == "older_than_two_years":
+        cutoff = audit.calendar_years_before(run_date or dt.date.today(), 2)
+        return {"mode": mode, "start": None, "end": str(cutoff - dt.timedelta(days=1)), "legacy": False}
 
     if mode == "legacy":
         effective_run_date = run_date or dt.date.today()
@@ -257,9 +289,9 @@ def apply_product_date_scope_settings(
 
 
 
-def media_processing_product_settings(state_dir: Path) -> dict[str, Any]:
+def media_processing_product_settings(state_dir: Path, saved_override: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Return which media types Veronica is allowed to process."""
-    saved = load_product_settings(state_dir)
+    saved = processing_product_settings(state_dir) if saved_override is None else saved_override
     image_exts = sorted(audit.IMAGE_EXTS)
     video_exts = sorted(audit.VIDEO_EXTS)
     audio_exts = sorted(audit.AUDIO_EXTS)
@@ -276,7 +308,7 @@ def media_processing_product_settings(state_dir: Path) -> dict[str, Any]:
                 if value in valid and value not in values:
                     values.append(value)
             return sorted(values)
-        return all_exts if legacy_enabled else []
+        return [ext for ext in all_exts if ext != ".gif"] if legacy_enabled else []
 
     images = bool(saved.get("process_images", True))
     videos = bool(saved.get("process_videos", True))
@@ -292,6 +324,7 @@ def media_processing_product_settings(state_dir: Path) -> dict[str, Any]:
         "image_extensions": image_enabled,
         "video_extensions": video_enabled,
         "audio_extensions": audio_enabled,
+        "excluded_directory_names": validated_excluded_directory_names(saved.get("excluded_directory_names", audit.DEFAULT_EXCLUDED_DIRECTORY_NAMES)),
     }
 
 
@@ -309,13 +342,14 @@ def apply_product_media_processing_settings(
     result["process_image_extensions"] = values["image_extensions"]
     result["process_video_extensions"] = values["video_extensions"]
     result["process_audio_extensions"] = values["audio_extensions"]
+    result["excluded_directory_names"] = values["excluded_directory_names"]
 
     return result
 
 
-def optimization_product_settings(state_dir: Path) -> dict[str, Any]:
+def optimization_product_settings(state_dir: Path, saved_override: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Return validated user-facing optimization recipe settings."""
-    saved = load_product_settings(state_dir)
+    saved = processing_product_settings(state_dir) if saved_override is None else saved_override
 
     def int_setting(key: str, default: int, low: int, high: int) -> int:
         try:
@@ -329,7 +363,7 @@ def optimization_product_settings(state_dir: Path) -> dict[str, Any]:
             value = float(saved.get(key, default))
         except (TypeError, ValueError):
             value = default
-        return min(max(value, low), high)
+        return min(max(value, low), high) if math.isfinite(value) else default
 
     image_format = str(saved.get("image_output_format") or "jpeg").lower()
     if image_format not in {"jpeg", "png"}:
@@ -339,7 +373,7 @@ def optimization_product_settings(state_dir: Path) -> dict[str, Any]:
         "image_output_format": image_format,
         "image_max_megapixels": float_setting(
             "image_max_megapixels",
-            float(DEFAULT_CONFIG["streams_image_max_megapixels"]),
+            float(DEFAULT_CONFIG["image_max_megapixels"]),
             1.0,
             60.0,
         ),
@@ -349,11 +383,14 @@ def optimization_product_settings(state_dir: Path) -> dict[str, Any]:
             30,
             95,
         ),
+        "recompress_images_below_target": bool(saved.get("recompress_images_below_target", True)),
+        "minimum_saving_percent": float_setting("minimum_saving_percent", 10.0, 0.0, 90.0),
+        "minimum_saving_mb": float_setting("minimum_saving_mb", 1.0, 0.0, 1024.0),
         "video_max_edge": int_setting(
             "video_max_edge",
             int(DEFAULT_CONFIG["video_max_storage_edge"]),
             480,
-            3840,
+            7680,
         ),
         "audio_min_size_mb": int_setting(
             "audio_min_size_mb",
@@ -379,9 +416,16 @@ def apply_product_optimization_settings(
     values = optimization_product_settings(state_dir)
 
     result["streams_image_max_megapixels"] = values["image_max_megapixels"]
+    result["image_max_megapixels"] = values["image_max_megapixels"]
     result["photo_library_max_megapixels"] = values["image_max_megapixels"]
+    result["jpeg_quality"] = values["jpeg_quality"]
     result["streams_jpeg_quality"] = values["jpeg_quality"]
     result["photo_library_jpeg_quality"] = values["jpeg_quality"]
+    saved = processing_product_settings(state_dir)
+    for key in ("recompress_images_below_target", "minimum_saving_percent"):
+        if key in saved: result[key] = values[key]
+    if "minimum_saving_mb" in saved:
+        result["minimum_saving_bytes"] = round(values["minimum_saving_mb"] * 1024 * 1024)
     result["video_max_storage_edge"] = values["video_max_edge"]
     result["audio_min_size_mb"] = values["audio_min_size_mb"]
     result["image_output_format"] = values["image_output_format"]
@@ -403,7 +447,380 @@ def apply_product_settings(
     result = apply_product_optimization_settings(result, state_dir)
     if run_date is not None:
         result = apply_product_date_scope_settings(result, state_dir, run_date)
+    result["date_evidence_policy"] = "embedded_only"
     return result
+
+RECIPE_SETTING_KEYS = {
+    "filename_standardization_enabled", "filename_date_format", "filename_max_bytes",
+    "date_scope_mode", "date_scope_start", "date_scope_end", "process_images", "process_videos", "process_audio",
+    "process_image_extensions", "process_video_extensions", "process_audio_extensions",
+    "image_output_format", "image_max_megapixels", "jpeg_quality", "video_max_edge", "audio_min_size_mb",
+    "video_allow_camera_metadata_drop", "excluded_directory_names",
+    "recompress_images_below_target", "minimum_saving_percent", "minimum_saving_mb",
+}
+
+
+def validated_excluded_directory_names(value: Any) -> list[str]:
+    if not isinstance(value, list) or len(value) > 100:
+        raise ValueError("Excluded directory names must be a list of at most 100 names")
+    result = []
+    seen = set()
+    for name in value:
+        if type(name) is not str or not name.strip() or name != name.strip() or len(name) > 100 or name in {".", ".."} or "/" in name or "\\" in name or any(not char.isprintable() for char in name):
+            raise ValueError("Excluded directories must be simple folder names without paths")
+        if name.casefold() not in seen:
+            seen.add(name.casefold())
+            result.append(name)
+    return result
+
+
+def recipe_flat_settings(recipe: dict[str, Any]) -> dict[str, Any]:
+    media = recipe["media_processing"]
+    opt = recipe["optimization_settings"]
+    filename = recipe["filename_policy"]
+    dates = recipe["date_scope"]
+    return {
+        **opt,
+        "excluded_directory_names": media.get("excluded_directory_names", audit.DEFAULT_EXCLUDED_DIRECTORY_NAMES),
+        "filename_standardization_enabled": filename["enabled"],
+        "filename_date_format": filename["date_format"], "filename_max_bytes": filename["max_bytes"],
+        "date_scope_mode": dates["mode"], "date_scope_start": dates.get("start"), "date_scope_end": dates.get("end"),
+        **{"process_" + key: media[key] for key in ("images", "videos", "audio")},
+        **{"process_" + key: media[key] for key in ("image_extensions", "video_extensions", "audio_extensions")},
+    }
+
+
+def recipe_product_settings(state_dir: Path, saved_override: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    dates = date_scope_product_settings(state_dir, saved_override=saved_override)
+    # Relative age/legacy cutoffs are evaluated afresh during analysis; they
+    # must never make a saved preset change merely because midnight passed.
+    if dates["mode"] not in {"within", "outside"}:
+        dates["start"] = dates["end"] = None
+    return {"media_processing": media_processing_product_settings(state_dir, saved_override),
+            "optimization_settings": optimization_product_settings(state_dir, saved_override),
+            "filename_policy": filename_product_settings(state_dir, saved_override), "date_scope": dates}
+
+
+def recipe_digest(state_dir: Path) -> str:
+    return sha256_text(canonical_json(recipe_product_settings(state_dir)))
+
+
+def validate_recipe(value: Any) -> dict[str, Any]:
+    required = {"media_processing", "optimization_settings", "filename_policy", "date_scope"}
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError("Recipe must contain media_processing, optimization_settings, filename_policy and date_scope")
+    result = json.loads(json.dumps(value, allow_nan=False))
+    def fields(group: str, keys: set[str]) -> dict[str, Any]:
+        data = result[group]
+        if not isinstance(data, dict) or set(data) != keys:
+            raise ValueError(f"Invalid {group} recipe fields")
+        return data
+    def boolean(data: dict[str, Any], key: str) -> None:
+        if type(data[key]) is not bool:
+            raise ValueError(f"{key} must be true or false")
+    def number(data: dict[str, Any], key: str, low: float, high: float, integer=False) -> None:
+        item = data[key]
+        if type(item) not in {int, float} or not math.isfinite(item) or not low <= item <= high or (integer and int(item) != item):
+            raise ValueError(f"{key} must be between {low:g} and {high:g}")
+        data[key] = int(item) if integer else float(item)
+    if isinstance(result["media_processing"], dict):
+        result["media_processing"].setdefault("excluded_directory_names", list(audit.DEFAULT_EXCLUDED_DIRECTORY_NAMES))
+    media = fields("media_processing", {"images", "videos", "audio", "image_extensions", "video_extensions", "audio_extensions", "excluded_directory_names"})
+    media["excluded_directory_names"] = validated_excluded_directory_names(media["excluded_directory_names"])
+    for kind, enabled, allowed in (("image", "images", audit.IMAGE_EXTS), ("video", "videos", audit.VIDEO_EXTS), ("audio", "audio", audit.AUDIO_EXTS)):
+        boolean(media, enabled)
+        key = kind + "_extensions"
+        extensions = media[key]
+        if not isinstance(extensions, list) or any(type(ext) is not str or ext not in allowed for ext in extensions):
+            raise ValueError(f"Unsupported {kind} extension")
+        media[key] = sorted(set(extensions))
+        if media[enabled] != bool(media[key]):
+            raise ValueError(f"{enabled} must match its enabled extensions")
+    if isinstance(result["optimization_settings"], dict):
+        result["optimization_settings"].setdefault("recompress_images_below_target", True)
+        result["optimization_settings"].setdefault("minimum_saving_percent", 10.0)
+        result["optimization_settings"].setdefault("minimum_saving_mb", 1.0)
+    opt = fields("optimization_settings", {"image_output_format", "image_max_megapixels", "jpeg_quality", "video_max_edge", "audio_min_size_mb", "video_allow_camera_metadata_drop", "recompress_images_below_target", "minimum_saving_percent", "minimum_saving_mb"})
+    if opt["image_output_format"] not in {"jpeg", "png"}:
+        raise ValueError("Image format must be jpeg or png")
+    number(opt, "image_max_megapixels", 1, 60)
+    number(opt, "jpeg_quality", 30, 95, True)
+    number(opt, "video_max_edge", 480, 7680, True)
+    boolean(opt, "recompress_images_below_target")
+    number(opt, "minimum_saving_percent", 0, 90)
+    number(opt, "minimum_saving_mb", 0, 1024)
+    number(opt, "audio_min_size_mb", 1, 500, True)
+    boolean(opt, "video_allow_camera_metadata_drop")
+    names = fields("filename_policy", {"enabled", "date_format", "max_bytes"})
+    boolean(names, "enabled")
+    if not valid_filename_date_format(names["date_format"]):
+        raise ValueError("Unsupported filename date format")
+    number(names, "max_bytes", 32, 255, True)
+    if len(filename_date_prefix(dt.date(2023, 1, 1), names["date_format"]).encode()) + 6 > names["max_bytes"]:
+        raise ValueError("Shorten the date style or increase the filename length.")
+    dates = result["date_scope"]
+    if not isinstance(dates, dict) or "mode" not in dates or set(dates) - {"mode", "start", "end", "legacy"}:
+        raise ValueError("Invalid date_scope recipe fields")
+    dates.setdefault("start", None)
+    dates.setdefault("end", None)
+    mode = dates["mode"]
+    if mode not in {"older_than_two_years", "legacy", "all", "within", "outside"}:
+        raise ValueError("Unsupported date scope")
+    if mode in {"within", "outside"}:
+        start = dt.date.fromisoformat(str(dates["start"]))
+        end = dt.date.fromisoformat(str(dates["end"]))
+        if start > end:
+            raise ValueError("Start date must be on or before end date")
+        dates.update(start=start.isoformat(), end=end.isoformat())
+    else:
+        dates.update(start=None, end=None)
+    dates["legacy"] = mode == "legacy"
+    return result
+
+
+def built_in_settings_presets() -> list[dict[str, Any]]:
+    recipe = {
+        "media_processing": {"images": True, "videos": True, "audio": True,
+            "image_extensions": sorted(audit.IMAGE_EXTS - {".gif"}), "video_extensions": sorted(audit.VIDEO_EXTS), "audio_extensions": sorted(audit.AUDIO_EXTS),
+            "excluded_directory_names": list(audit.DEFAULT_EXCLUDED_DIRECTORY_NAMES)},
+        "optimization_settings": {"image_output_format": "jpeg", "image_max_megapixels": 20.0, "jpeg_quality": 70, "video_max_edge": 1280, "audio_min_size_mb": 10, "video_allow_camera_metadata_drop": True, "recompress_images_below_target": True, "minimum_saving_percent": 10.0, "minimum_saving_mb": 1.0},
+        "filename_policy": {"enabled": True, "date_format": "YYMMDD-", "max_bytes": 60},
+        "date_scope": {"mode": "older_than_two_years", "start": None, "end": None, "legacy": False},
+    }
+    smaller = json.loads(json.dumps(recipe))
+    smaller["optimization_settings"]["image_max_megapixels"] = 10.0
+    images = json.loads(json.dumps(recipe))
+    images["media_processing"].update(videos=False, audio=False, video_extensions=[], audio_extensions=[])
+    return [{"id": identifier, "name": name, "built_in": True, "recipe": item}
+            for identifier, name, item in (("balanced", "Balanced", recipe), ("smaller-files", "Smaller files", smaller), ("images-only", "Images only", images))]
+
+
+def settings_presets(state_dir: Path) -> tuple[list[dict[str, Any]], str]:
+    saved = load_product_settings(state_dir)
+    presets = built_in_settings_presets()
+    raw = saved.get("settings_presets")
+    if raw is None:
+        # One immutable snapshot of historical app defaults. A legacy root's
+        # folder_recipe is deliberately not consulted for future folders.
+        if set(saved) & RECIPE_SETTING_KEYS:
+            flat = {key: val for key, val in saved.items() if key != "folder_recipe"}
+            # Read through existing validators without touching the disk.
+            recipe = recipe_from_flat_settings(flat)
+            presets.append({"id": "previous-defaults", "name": "Previous defaults", "built_in": False, "recipe": recipe})
+            return presets, "previous-defaults"
+        return presets, "balanced"
+    if not isinstance(raw, list):
+        raise ValueError("Invalid saved settings presets")
+    used = {item["id"] for item in presets}
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("Invalid saved settings preset")
+        identifier = validate_preset_id(item.get("id"))
+        if identifier in used:
+            raise ValueError("Duplicate saved settings preset")
+        used.add(identifier)
+        presets.append({"id": identifier, "name": validate_preset_name(item.get("name")), "built_in": False, "recipe": validate_recipe(item.get("recipe"))})
+    default_id = saved.get("default_preset_id", "balanced")
+    return presets, default_id if default_id in used else "balanced"
+
+
+def recipe_from_flat_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    return recipe_product_settings(Path("/unused-veronica-recipe"), settings)
+
+
+def synchronize_legacy_recipe_update(settings: dict[str, Any], changed_keys: set[str]) -> None:
+    """Compatibility CLI edits the current folder, never future-folder defaults."""
+    if isinstance(settings.get("folder_recipe"), dict):
+        values = recipe_flat_settings(settings["folder_recipe"])
+        values.update({key: settings[key] for key in changed_keys if key in settings})
+        settings["folder_recipe"] = validate_recipe(recipe_from_flat_settings(values))
+        settings["folder_recipe_revision"] = now_iso()
+        settings["folder_preset_id"] = None
+
+
+def persist_preset_catalog(state_dir: Path, presets: list[dict[str, Any]], default_id: str) -> None:
+    saved = load_product_settings(state_dir)
+    saved["settings_presets"] = [item for item in presets if not item["built_in"]]
+    saved["default_preset_id"] = default_id
+    save_product_settings(state_dir, saved)
+
+
+def validate_preset_id(value: Any) -> str:
+    if type(value) is not str or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", value):
+        raise ValueError("Invalid preset identifier")
+    return value
+
+
+def validate_preset_name(value: Any) -> str:
+    if type(value) is not str or not value.strip() or len(value.strip()) > 80 or any(not char.isprintable() for char in value):
+        raise ValueError("Preset name must contain 1 to 80 printable characters")
+    return value.strip()
+
+
+def validate_folder_roots(folders: list[Path]) -> None:
+    for index, left in enumerate(folders):
+        for right in folders[index + 1:]:
+            # samefile also covers macOS firmlinks/case aliases beyond resolve().
+            def contains(parent: Path, child: Path) -> bool:
+                for candidate in (child, *child.parents):
+                    try:
+                        if parent == candidate or (parent.exists() and candidate.exists() and parent.samefile(candidate)):
+                            return True
+                    except OSError:
+                        pass
+                return False
+            if contains(left, right) or contains(right, left):
+                raise ValueError(f"Configured folders may not overlap: {left} and {right}")
+
+
+def validate_media_state_roots(folder: Path, state_dir: Path) -> None:
+    try:
+        validate_folder_roots([folder.expanduser().resolve(), state_dir.expanduser().resolve()])
+    except ValueError:
+        raise ValueError("Media folders must be separate from Veronica's data folder. Choose folders that do not contain one another, so recovery originals cannot be scanned.") from None
+
+
+def folder_settings_payload(base_state_dir: Path, folder: Path) -> dict[str, Any]:
+    folder = folder.expanduser().resolve()
+    state = scan_folder_state_dir(base_state_dir, folder)
+    saved = load_product_settings(state)
+    recipe = recipe_product_settings(state)
+    identifier = saved.get("folder_preset_id")
+    presets, _ = settings_presets(base_state_dir)
+    preset = next((item for item in presets if item["id"] == identifier), None)
+    needs_analysis = True
+    db = state / "media-maintenance.sqlite"
+    if db.is_file():
+        with security.database(db) as con:
+            row = con.execute("SELECT plan_id FROM plans ORDER BY created_at DESC LIMIT 1").fetchone()
+        if row:
+            paths = sorted(state.glob(f"plan-*-{str(row[0])[:12]}.json"))
+            try:
+                if paths:
+                    load_plan(paths[-1], state)
+                    needs_analysis = False
+            except (ValueError, OSError, sqlite3.Error):
+                pass
+    # A preset is a snapshot. Edited/deleted custom presets do not relabel an
+    # independently saved folder recipe as if it had changed too.
+    matching_preset = preset if preset and preset["recipe"] == recipe else None
+    return {"folder": str(folder), "state_dir": str(state), "recipe": recipe,
+            "preset_id": matching_preset["id"] if matching_preset else None,
+            "preset_name": matching_preset["name"] if matching_preset else None,
+            "needs_analysis": needs_analysis}
+
+
+def requested_configured_folder(args: argparse.Namespace, base: Path) -> Path:
+    folder = Path(args.folder).expanduser().resolve()
+    folders = configured_scan_folders(base)
+    validate_folder_roots(folders)
+    if folder not in folders:
+        raise ValueError("Add this folder to Veronica before configuring its settings")
+    return folder
+
+
+@security.state_operation
+def cmd_folder_settings(args: argparse.Namespace) -> int:
+    base = Path(args.state_dir).expanduser().resolve()
+    folder = requested_configured_folder(args, base)
+    prepare_scan_folder_state(base, folder)
+    print(json.dumps(folder_settings_payload(base, folder), ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def write_folder_recipe(base: Path, folder: Path, recipe: dict[str, Any], preset_id: Optional[str] = None) -> None:
+    state = prepare_scan_folder_state(base, folder)
+    with security.state_access(state, folder):
+        security.recover_transactions(state)
+        saved = load_product_settings(state)
+        if saved.get("folder_recipe") != recipe:
+            saved["folder_recipe"] = recipe
+            saved["folder_recipe_revision"] = now_iso()
+        saved["folder_preset_id"] = preset_id
+        save_product_settings(state, saved)
+
+
+@security.state_operation
+def cmd_configure_folder(args: argparse.Namespace) -> int:
+    base = Path(args.state_dir).expanduser().resolve()
+    folder = requested_configured_folder(args, base)
+    recipe = validate_recipe(json.loads(args.recipe_json))
+    write_folder_recipe(base, folder, recipe)
+    print(json.dumps(folder_settings_payload(base, folder), ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+@security.state_operation
+def cmd_presets(args: argparse.Namespace) -> int:
+    base = Path(args.state_dir).expanduser().resolve()
+    presets, default_id = settings_presets(base)
+    persist_preset_catalog(base, presets, default_id)
+    print(json.dumps({"presets": presets, "default_preset_id": default_id}, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+@security.state_operation
+def cmd_save_preset(args: argparse.Namespace) -> int:
+    base = Path(args.state_dir).expanduser().resolve()
+    presets, default_id = settings_presets(base)
+    recipe = validate_recipe(json.loads(args.recipe_json))
+    name = validate_preset_name(args.name)
+    identifier = validate_preset_id(args.preset_id) if args.preset_id else "custom-" + os.urandom(8).hex()
+    existing = next((item for item in presets if item["id"] == identifier), None)
+    if args.preset_id and existing is None:
+        raise ValueError("Preset does not exist")
+    if existing and existing["built_in"]:
+        raise ValueError("Built-in presets cannot be changed")
+    if any(item["name"].casefold() == name.casefold() and item["id"] != identifier for item in presets):
+        raise ValueError("A preset with this name already exists")
+    item = {"id": identifier, "name": name, "built_in": False, "recipe": recipe}
+    presets = [item if old["id"] == identifier else old for old in presets] if existing else presets + [item]
+    persist_preset_catalog(base, presets, default_id)
+    print(json.dumps(item, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+@security.state_operation
+def cmd_delete_preset(args: argparse.Namespace) -> int:
+    base = Path(args.state_dir).expanduser().resolve()
+    presets, default_id = settings_presets(base)
+    identifier = validate_preset_id(args.preset_id)
+    existing = next((item for item in presets if item["id"] == identifier), None)
+    if existing is None or existing["built_in"]:
+        raise ValueError("Only a saved custom preset can be deleted")
+    presets = [item for item in presets if item["id"] != identifier]
+    if default_id == identifier:
+        default_id = "balanced"
+    persist_preset_catalog(base, presets, default_id)
+    print(json.dumps({"deleted": identifier, "default_preset_id": default_id}))
+    return 0
+
+
+@security.state_operation
+def cmd_apply_preset(args: argparse.Namespace) -> int:
+    base = Path(args.state_dir).expanduser().resolve()
+    folder = requested_configured_folder(args, base)
+    presets, _ = settings_presets(base)
+    identifier = validate_preset_id(args.preset_id)
+    preset = next((item for item in presets if item["id"] == identifier), None)
+    if preset is None:
+        raise ValueError("Preset does not exist")
+    write_folder_recipe(base, folder, preset["recipe"], identifier)
+    print(json.dumps(folder_settings_payload(base, folder), ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+@security.state_operation
+def cmd_set_default_preset(args: argparse.Namespace) -> int:
+    base = Path(args.state_dir).expanduser().resolve()
+    presets, _ = settings_presets(base)
+    identifier = validate_preset_id(args.preset_id)
+    if not any(item["id"] == identifier for item in presets):
+        raise ValueError("Preset does not exist")
+    persist_preset_catalog(base, presets, identifier)
+    print(json.dumps({"default_preset_id": identifier}))
+    return 0
+
 
 def database_archive_root(state_dir: Path) -> Optional[Path]:
     db = state_dir / "media-maintenance.sqlite"
@@ -484,6 +901,15 @@ def scan_folder_state_dir(base_state_dir: Path, folder: Path) -> Path:
 
 
 def prepare_scan_folder_state(base_state_dir: Path, folder: Path) -> Path:
+    validate_media_state_roots(folder, base_state_dir)
+    with security.operation_lock(base_state_dir.expanduser().resolve()):
+        presets, default_id = settings_presets(base_state_dir)
+        if "settings_presets" not in load_product_settings(base_state_dir):
+            persist_preset_catalog(base_state_dir, presets, default_id)
+        return _prepare_scan_folder_state(base_state_dir, folder)
+
+
+def _prepare_scan_folder_state(base_state_dir: Path, folder: Path) -> Path:
     """Prepare one folder's isolated state without disturbing existing history."""
     base_state_dir = base_state_dir.expanduser().resolve()
     folder = folder.expanduser().resolve()
@@ -496,61 +922,41 @@ def prepare_scan_folder_state(base_state_dir: Path, folder: Path) -> Path:
             f"state={folder_state} database_root={existing_root} requested_root={folder}"
         )
 
-    # The historical/root state already owns its settings. Do not replace its
-    # top-level scan_folders list with a one-folder list.
-    if folder_state == base_state_dir:
-        return folder_state
-
-    parent_filename = filename_product_settings(base_state_dir)
-    child = load_product_settings(folder_state)
-    child["archive_root"] = str(folder)
-    child["scan_folders"] = [str(folder)]
-    child["filename_standardization_enabled"] = parent_filename["enabled"]
-    child["filename_date_format"] = parent_filename["date_format"]
-    child["filename_max_bytes"] = parent_filename["max_bytes"]
-
-    parent_scope = date_scope_product_settings(base_state_dir)
-    child["date_scope_mode"] = parent_scope["mode"]
-    child["date_scope_start"] = parent_scope.get("start")
-    child["date_scope_end"] = parent_scope.get("end")
-
-    # Media-processing preferences are global product settings. Managed
-    # per-folder state must inherit them so annual-all cannot silently fall
-    # back to the default of processing every media type.
-    parent_media = media_processing_product_settings(base_state_dir)
-    child["process_images"] = parent_media["images"]
-    child["process_videos"] = parent_media["videos"]
-    child["process_audio"] = parent_media["audio"]
-    child["process_image_extensions"] = parent_media["image_extensions"]
-    child["process_video_extensions"] = parent_media["video_extensions"]
-    child["process_audio_extensions"] = parent_media["audio_extensions"]
-
-    # Optimization recipe preferences are also global product settings. Folder
-    # plans are created from their isolated state directories, so copy the
-    # effective recipe into that state before analysis or annual maintenance.
-    parent_optimization = optimization_product_settings(base_state_dir)
-    child["image_output_format"] = parent_optimization["image_output_format"]
-    child["image_max_megapixels"] = parent_optimization["image_max_megapixels"]
-    child["jpeg_quality"] = parent_optimization["jpeg_quality"]
-    child["video_max_edge"] = parent_optimization["video_max_edge"]
-    child["audio_min_size_mb"] = parent_optimization["audio_min_size_mb"]
-    child["video_allow_camera_metadata_drop"] = parent_optimization[
-        "video_allow_camera_metadata_drop"
-    ]
-
-    parent_saved = load_product_settings(base_state_dir)
-    if "media_processing_settings_updated_at" in parent_saved:
-        child["media_processing_settings_updated_at"] = (
-            parent_saved["media_processing_settings_updated_at"]
-        )
-    if "optimization_settings_updated_at" in parent_saved:
-        child["optimization_settings_updated_at"] = (
-            parent_saved["optimization_settings_updated_at"]
-        )
-
-    child["managed_by_multi_folder"] = True
-    child["parent_state_dir"] = str(base_state_dir)
-    save_product_settings(folder_state, child)
+    with security.state_access(folder_state, folder):
+        child = load_product_settings(folder_state)
+        if not isinstance(child.get("folder_recipe"), dict):
+            # Preserve explicit historical settings; only a genuinely new folder
+            # receives the currently selected default preset, once.
+            inherited = bool(set(child) & RECIPE_SETTING_KEYS) or existing_root is not None
+            if inherited:
+                recipe = recipe_product_settings(folder_state)
+                # Historical read-only archive protection becomes an explicit
+                # exclusion on this migrated library, never a new-app default.
+                if existing_root is not None and (folder / "Imagehead").is_dir():
+                    exclusions = recipe["media_processing"]["excluded_directory_names"]
+                    if "imagehead" not in {name.casefold() for name in exclusions}:
+                        exclusions.append("Imagehead")
+                preset_id = None
+            else:
+                presets, default_id = settings_presets(base_state_dir)
+                selected = next(item for item in presets if item["id"] == default_id)
+                recipe = selected["recipe"]
+                preset_id = selected["id"]
+            child["folder_recipe"] = recipe
+            child["folder_recipe_revision"] = now_iso()
+            child["folder_preset_id"] = preset_id
+            child["folder_settings_initialized"] = True
+            if folder_state != base_state_dir:
+                # Keep flat values for legacy CLI consumers, without copying
+                # parent preferences over an existing folder again.
+                child.update(recipe_flat_settings(recipe))
+                for key in ("media_processing_settings_updated_at", "optimization_settings_updated_at"):
+                    if key in load_product_settings(base_state_dir):
+                        child.setdefault(key, load_product_settings(base_state_dir)[key])
+            if folder_state != base_state_dir:
+                child.update(archive_root=str(folder), scan_folders=[str(folder)],
+                             managed_by_multi_folder=True, parent_state_dir=str(base_state_dir))
+            save_product_settings(folder_state, child)
     return folder_state
 
 
@@ -566,14 +972,54 @@ def require_archive_root(state_dir: Path, explicit: Optional[str] = None) -> Pat
 def dependency_status() -> dict[str, Any]:
     tools = {}
     for name in ("file", "ffprobe", "HandBrakeCLI", "ffmpeg", "xattr"):
-        found = shutil.which(name)
+        try:
+            found = security.resolve_tool(name)
+        except (ValueError, RuntimeError, OSError):
+            found = None
         tools[name] = {"available": bool(found), "path": found}
     try:
+        import media_dates
+        command=media_dates.exiftool_command()
+        tools['ExifTool']={'available':True,'path':command[1]}
+        tools['Perl']={'available':True,'path':command[0]}
+    except (ValueError,RuntimeError,OSError):
+        tools['ExifTool']={'available':False,'path':None}
+        tools['Perl']={'available':Path('/usr/bin/perl5.34').is_file(),'path':'/usr/bin/perl5.34'}
+    try:
         import PIL  # type: ignore
-        pillow = {"available": True, "version": getattr(PIL, "__version__", None)}
+        pillow = {"available": tuple(int(n) for n in PIL.__version__.split(".")[:3]) >= (12, 3, 0), "version": getattr(PIL, "__version__", None)}
     except Exception:
         pillow = {"available": False, "version": None}
     return {"tools": tools, "pillow": pillow, "python": sys.executable, "python_version": sys.version.split()[0]}
+
+
+@security.state_operation
+def cmd_prepare_runtime(args: argparse.Namespace) -> int:
+    """Prepare shipped components offline; never install software on the Mac."""
+    state=Path(args.state_dir).expanduser().resolve();status=dependency_status()
+    missing=[name for name,tool in status['tools'].items() if not tool['available']]
+    if not status['pillow']['available']:missing.append('photo component')
+    if missing:raise RuntimeError('Veronica could not prepare its built-in components ('+', '.join(missing)+'). Reinstall the complete Veronica app and try again.')
+    if getattr(sys,'frozen',False):
+        fingerprint=security.digest(Path(sys._MEIPASS)/'security-manifest.json')
+    else:fingerprint=sha256_text(canonical_json(status))
+    receipt=security.inside(state,'runtime-setup.json')
+    try:saved=json.loads(receipt.read_text()) if receipt.exists() else {}
+    except (ValueError,OSError):saved={}
+    prepared=saved.get('fingerprint')!=fingerprint
+    if prepared:
+        commands={name:[status['tools'][name]['path'],flag] for name,flag in
+                  (('ffmpeg','-version'),('ffprobe','-version'),('HandBrakeCLI','--version'))}
+        import media_dates
+        commands['ExifTool']=[*media_dates.exiftool_command(),'-ver']
+        versions={}
+        for name,command in commands.items():
+            result=security.bounded_run(command,timeout=60,reads=[Path(p) for p in command if p.startswith('/')])
+            if result.returncode:raise RuntimeError('Veronica could not start a built-in component ('+name+'). Reinstall the complete app and try again.')
+            versions[name]=(result.stdout+'\n'+result.stderr).strip().splitlines()[0][:512]
+        security.atomic_json(receipt,{'fingerprint':fingerprint,'prepared_at':now_iso(),'versions':versions})
+    print(json.dumps({'ready':True,'prepared_now':prepared,'components':status}))
+    return 0
 
 
 def configure_event_stream(path_text: Optional[str]) -> None:
@@ -653,6 +1099,7 @@ def _rewrite_state_paths(db_path: Path, old_root: Path, new_root: Path) -> int:
     return changed
 
 
+@security.migration_operation
 def cmd_migrate_state(args: argparse.Namespace) -> int:
     """Safely relocate the legacy state directory into Application Support."""
     # Keep the lexical path spellings as well as their canonical forms.
@@ -720,7 +1167,9 @@ def cmd_migrate_state(args: argparse.Namespace) -> int:
 
 
 def init_db(path: Path, root: Path) -> sqlite3.Connection:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    security.private_directory(path.parent)
+    if path.is_symlink():
+        raise ValueError("State database cannot be a symbolic link")
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
@@ -921,7 +1370,12 @@ def init_db(path: Path, root: Path) -> sqlite3.Connection:
       WHERE si.status='KEEP_ORIGINAL' AND si.operation IN ('CONVERT_IMAGE','CONVERT_VIDEO','CONVERT_AUDIO') AND pi.policy_version IS NOT NULL
     """)
     con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
-    con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('root',?)", (str(root.resolve()),))
+    existing_root = con.execute("SELECT value FROM meta WHERE key='root'").fetchone()
+    if existing_root and Path(existing_root[0]).resolve() != root.resolve():
+        con.close()
+        raise ValueError("This state database belongs to a different library")
+    con.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('root',?)", (str(root.resolve()),))
+    os.chmod(path, 0o600)
     con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('tool_version',?)", (VERSION,))
     con.commit()
     return con
@@ -960,7 +1414,7 @@ def upsert_asset(con: sqlite3.Connection, row: dict[str, Any], run_id: str, cfg:
     return asset_id
 
 
-def historical_keep_original(con: sqlite3.Connection, asset_id: int, operation: str, policy_version: Optional[str], current_quick_hash: Optional[str], current_size: Optional[int] = None) -> Optional[sqlite3.Row]:
+def historical_keep_original(con: sqlite3.Connection, asset_id: int, operation: str, policy_version: Optional[str], current_quick_hash: Optional[str], current_size: Optional[int] = None, recipe_hash: Optional[str] = None) -> Optional[sqlite3.Row]:
     """Return durable KEEP_ORIGINAL evidence only for the same asset content and policy.
     A changed file or changed policy must be evaluated again.
     """
@@ -973,6 +1427,10 @@ def historical_keep_original(con: sqlite3.Connection, asset_id: int, operation: 
     ).fetchone()
     if row is not None and current_size is not None and row["source_size"] is not None and int(row["source_size"]) != int(current_size):
         return None
+    if row is not None and recipe_hash is not None:
+        prior_recipe = json.loads(row["details_json"]).get("recipe_digest")
+        if prior_recipe is not None and prior_recipe != recipe_hash:
+            return None
     return row
 
 
@@ -1010,7 +1468,9 @@ def is_date_only_review_reason(reason: Optional[str]) -> bool:
 
 
 def should_auto_optimize_date_review(row: dict[str, Any], cfg: dict[str, Any]) -> bool:
-    """Date uncertainty may be bypassed only when date is not the scope filter."""
+    """Legacy date overrides never bypass the current embedded-only policy."""
+    if cfg.get("date_evidence_policy") == "embedded_only" or row.get("reason") == "embedded_date_missing":
+        return False
     if row.get("action") != "REVIEW":
         return False
     if row.get("detected_kind") not in {"image", "video", "audio"}:
@@ -1153,6 +1613,7 @@ def resolved_keep_original_relpaths(con: sqlite3.Connection, plan_id: str, opera
       SELECT DISTINCT pi.relpath
       FROM plan_items pi
       JOIN disposition_history dh ON dh.asset_id=pi.asset_id
+       AND dh.plan_id=pi.plan_id
        AND dh.operation=pi.operation
        AND dh.policy_version=pi.policy_version
        AND dh.disposition='KEEP_ORIGINAL'
@@ -1163,6 +1624,13 @@ def resolved_keep_original_relpaths(con: sqlite3.Connection, plan_id: str, opera
     if operation:
         sql += " AND pi.operation=?"; vals.append(operation)
     return {str(r[0]) for r in con.execute(sql, tuple(vals)).fetchall()}
+
+
+def unreadable_source_relpaths(con: sqlite3.Connection, plan_id: str) -> set[str]:
+    """Skip an unreadable original only within this exact frozen scan."""
+    return {str(row[0]) for row in con.execute(
+        "SELECT DISTINCT si.relpath FROM staging_items si JOIN staging_runs sr USING(staging_id) "
+        "WHERE sr.plan_id=? AND si.status='SOURCE_UNREADABLE'", (plan_id,))}
 
 
 def historical_video_completion(con: sqlite3.Connection, asset_id: int, current_quick_hash: Optional[str], current_full_hash: Optional[str] = None) -> Optional[sqlite3.Row]:
@@ -1188,7 +1656,26 @@ def historical_video_completion(con: sqlite3.Connection, asset_id: int, current_
 
 
 _CANONICAL_DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}_")
-_SUPPORTED_FILENAME_DATE_FORMATS = {"YYYY-MM-DD_"}
+_SUPPORTED_FILENAME_DATE_FORMATS = {"YYYY-MM-DD_", "YYMMDD-", "YYYYMMDD-", "DD-MM-YYYY_"}
+_DATE_TOKEN = re.compile(r"YYYY|YY|MM|DD")
+_DATE_PREFIX = re.compile(r"^(?:\d{4}[-_. ]*\d{2}[-_. ]*\d{2}|\d{2}[-_. ]*\d{2}[-_. ]*(?:\d{4}|\d{2})|\d{2}[-_. ]*\d{4}[-_. ]*\d{2})[-_. ]+")
+
+
+def valid_filename_date_format(value: Any) -> bool:
+    if type(value) is not str or not 6 <= len(value) <= 32 or value[-1] not in "-_. ":
+        return False
+    tokens = _DATE_TOKEN.findall(value)
+    return (len(tokens) == 3 and tokens.count("MM") == 1 and tokens.count("DD") == 1
+            and tokens.count("YYYY") + tokens.count("YY") == 1
+            and re.fullmatch(r"[-_. ]*", _DATE_TOKEN.sub("", value)) is not None)
+
+
+def filename_date_prefix(day: dt.date, style: str) -> str:
+    if not valid_filename_date_format(style):
+        raise ValueError("Use YYYY (or YY), MM and DD once each, separated by dashes, dots, underscores or spaces; end with a separator.")
+    values = {"YYYY": f"{day.year:04d}", "YY": f"{day.year % 100:02d}", "MM": f"{day.month:02d}", "DD": f"{day.day:02d}"}
+    return _DATE_TOKEN.sub(lambda match: values[match.group()], style)
+
 
 
 def _truncate_utf8(value: str, max_bytes: int) -> str:
@@ -1223,8 +1710,8 @@ def canonical_media_filename(
     if not best_date:
         return None
 
-    date_format = str(cfg.get("filename_date_format") or "YYYY-MM-DD_")
-    if date_format not in _SUPPORTED_FILENAME_DATE_FORMATS:
+    date_format = str(cfg.get("filename_date_format") or DEFAULT_CONFIG["filename_date_format"])
+    if not valid_filename_date_format(date_format):
         raise ValueError(f"unsupported filename_date_format:{date_format}")
 
     try:
@@ -1233,7 +1720,13 @@ def canonical_media_filename(
         return None
 
     original = Path(relpath)
-    stem = _CANONICAL_DATE_PREFIX.sub("", original.stem, count=1)
+    stem = _DATE_PREFIX.sub("", original.stem, count=1)
+    if date_format == "YYMMDD-":
+        stem = re.sub(r"^\d{6}[-_]", "", stem)
+        stem = unicodedata.normalize("NFKD", stem).encode("ascii", "ignore").decode("ascii")
+        stem = re.sub(r"[\s_.]+", "-", stem)
+        stem = re.sub(r"[^a-zA-Z0-9-]", "", stem)
+        stem = re.sub(r"-+", "-", stem).strip("-")
     stem = stem.strip()
     if not stem:
         stem = "media"
@@ -1242,9 +1735,9 @@ def canonical_media_filename(
     if extension and not extension.startswith("."):
         extension = "." + extension
 
-    prefix = date_value.strftime("%Y-%m-%d") + "_"
+    prefix = filename_date_prefix(date_value, date_format)
 
-    configured_max = int(cfg.get("filename_max_bytes") or 180)
+    configured_max = int(cfg.get("filename_max_bytes") or DEFAULT_CONFIG["filename_max_bytes"])
     if configured_max < 32:
         configured_max = 32
 
@@ -1257,7 +1750,7 @@ def canonical_media_filename(
     if available_stem_bytes < 1:
         raise ValueError("filename_max_bytes_too_small_for_date_and_extension")
 
-    stem = _truncate_utf8(stem, available_stem_bytes).rstrip()
+    stem = _truncate_utf8(stem, available_stem_bytes).rstrip("-" if date_format == "YYMMDD-" else " ")
     if not stem:
         stem = "media"
         stem = _truncate_utf8(stem, available_stem_bytes)
@@ -1275,7 +1768,7 @@ def apply_filename_policy(
     """Attach canonical destination naming or turn an eligible skip into RENAME."""
     # A disabled media type must remain completely untouched.
     # Filename standardization must not turn it into an executable rename.
-    if item.get("operation") == "SKIP_MEDIA_TYPE_DISABLED":
+    if item.get("operation") in {"SKIP_MEDIA_TYPE_DISABLED", "SKIP_EXTENSION_DISABLED"}:
         return item
 
     if not cfg.get("filename_standardization_enabled", True):
@@ -1317,8 +1810,8 @@ def apply_filename_policy(
         "final_relpath": final_relpath,
         "filename_standardization": True,
         "filename_date": str(best_date),
-        "filename_date_format": str(cfg.get("filename_date_format") or "YYYY-MM-DD_"),
-        "filename_max_bytes": min(int(cfg.get("filename_max_bytes") or 180), 255),
+        "filename_date_format": str(cfg.get("filename_date_format") or DEFAULT_CONFIG["filename_date_format"]),
+        "filename_max_bytes": min(int(cfg.get("filename_max_bytes") or DEFAULT_CONFIG["filename_max_bytes"]), 255),
     })
     item["target"] = target
 
@@ -1341,9 +1834,11 @@ def apply_filename_policy(
     return item
 
 
-def _filename_suffix_candidate(relpath: str, suffix_number: int) -> str:
+def _filename_suffix_candidate(relpath: str, suffix_number: int, max_bytes: int = 255) -> str:
     path = Path(relpath)
-    return (path.parent / f"{path.stem}-{suffix_number}{path.suffix}").as_posix()
+    suffix = f"-{suffix_number}{path.suffix}"
+    stem = _truncate_utf8(path.stem, max_bytes - len(suffix.encode("utf-8"))).rstrip("- ")
+    return (path.parent / f"{stem}{suffix}").as_posix()
 
 
 def resolve_filename_collisions(
@@ -1375,7 +1870,7 @@ def resolve_filename_collisions(
         suffix_number = 2
 
         while chosen in used_destinations or chosen in occupied_by_other_asset:
-            chosen = _filename_suffix_candidate(original_final, suffix_number)
+            chosen = _filename_suffix_candidate(original_final, suffix_number, int(item.get("target", {}).get("filename_max_bytes", 255)))
             suffix_number += 1
             if suffix_number > 1000:
                 target = dict(item.get("target") or {})
@@ -1417,6 +1912,7 @@ def make_item(row: dict[str, Any], asset_id: int, cfg: dict[str, Any]) -> dict[s
         "asset_id": asset_id,
         "relpath": row["relpath"],
         "source_quick_hash": row.get("quick_hash"),
+        "source_full_hash": row.get("full_hash"),
         "source_size": int(row.get("size") or 0),
         "source_mtime_ns": int(float(row.get("mtime_ts") or 0) * 1_000_000_000),
         "operation": "SKIP",
@@ -1487,8 +1983,8 @@ def make_item(row: dict[str, Any], asset_id: int, cfg: dict[str, Any]) -> dict[s
     if row.get("action") == "REVIEW":
         base.update(operation="REVIEW", reason=row.get("reason") or "audit_review")
         return base
-    if row.get("reason") == "too_new":
-        base.update(operation="SKIP_TOO_NEW", reason="too_new")
+    if row.get("reason") in {"too_new", "date_scope_excluded"}:
+        base.update(operation="SKIP_TOO_NEW", reason=row["reason"])
         return base
     if row.get("reason") == "audio_below_size_threshold":
         base.update(operation="SKIP_NO_BENEFIT", reason="audio_below_size_threshold")
@@ -1498,7 +1994,7 @@ def make_item(row: dict[str, Any], asset_id: int, cfg: dict[str, Any]) -> dict[s
     # verify it still meets the current dimensional policy; a mismatch becomes review.
     if v2:
         if kind == "image":
-            target_mp = float(cfg.get("streams_image_max_megapixels", 10) if root == "Streams" else cfg.get("photo_library_max_megapixels", 20))
+            target_mp = float(cfg.get("image_max_megapixels", 20))
             mp = row.get("megapixels")
             if mp is not None and float(mp) > target_mp + 0.01:
                 base.update(operation="REVIEW", reason="legacy_v2_but_image_exceeds_current_target", target={"max_megapixels": target_mp})
@@ -1513,21 +2009,12 @@ def make_item(row: dict[str, Any], asset_id: int, cfg: dict[str, Any]) -> dict[s
         base.update(operation="SKIP", reason=row.get("reason") or "not_candidate")
         return base
 
-    # Historical named roots retain their special policy where applicable,
-    # while arbitrary user-configured folders use the general media policy.
-    is_photo_library = root == "Photo_Library"
-
     if kind == "image":
-        target_mp = float(
-            cfg.get(
-                "photo_library_max_megapixels" if is_photo_library else "streams_image_max_megapixels",
-                20 if is_photo_library else 10,
-            )
-        )
+        target_mp = float(cfg.get("image_max_megapixels", 20))
         mp = row.get("megapixels")
         if mp is None:
             base.update(operation="REVIEW", reason="image_dimensions_unknown")
-        elif float(mp) <= target_mp:
+        elif float(mp) <= target_mp and not cfg.get("recompress_images_below_target", True):
             base.update(
                 operation="SKIP_NO_BENEFIT",
                 reason="image_at_or_below_target",
@@ -1541,12 +2028,10 @@ def make_item(row: dict[str, Any], asset_id: int, cfg: dict[str, Any]) -> dict[s
             fmt = "png" if requested_format == "png" else "jpeg"
             if ext == ".png" and row.get("has_alpha"):
                 fmt = "png"
-            policy_key = "photo_library_image" if is_photo_library else "streams_image"
-            reason = (
-                "photo_library_image_above_target"
-                if is_photo_library
-                else "image_above_target"
-            )
+            policy_key = "image"
+            reason = "image_above_target"
+            if float(mp) <= target_mp:
+                reason = "image_recompress_at_original_dimensions"
             base.update(
                 operation="CONVERT_IMAGE",
                 policy_version=policies.get(policy_key),
@@ -1632,28 +2117,62 @@ def write_plan_files(state_dir: Path, plan: dict[str, Any]) -> tuple[Path, Path]
 
 
 
-def load_plan(path: Path) -> dict[str, Any]:
+def load_plan(path: Path, state_dir: Optional[Path] = None) -> dict[str, Any]:
+    if path.is_symlink():
+        raise ValueError("Frozen plan cannot be a symbolic link")
     plan = json.loads(path.read_text(encoding="utf-8"))
     required = {"plan_id", "root", "items", "run_date", "cutoff"}
-    missing = required - set(plan)
-    if missing:
-        raise SystemExit(f"Invalid plan, missing: {', '.join(sorted(missing))}")
+    if not required <= set(plan):
+        raise ValueError("Invalid frozen plan")
+    security.identifier(plan["plan_id"], 64)
+    core = {k: v for k, v in plan.items() if k not in {"plan_id", "created_at"}}
+    if sha256_text(canonical_json(core)) != plan["plan_id"]:
+        raise ValueError("Frozen plan has changed. Analyze the folder again before continuing.")
+    if (plan.get("config_snapshot") or {}).get("date_evidence_policy") != "embedded_only":
+        raise ValueError("Scan folders again to use the embedded-date policy before continuing.")
+    db = (state_dir or path.parent) / "media-maintenance.sqlite"
+    with security.database(db) as con:
+        row = con.execute("SELECT plan_sha256 FROM plans WHERE plan_id=?", (plan["plan_id"],)).fetchone()
+        root_row = con.execute("SELECT value FROM meta WHERE key='root'").fetchone()
+    if not row or row[0] != sha256_text(canonical_json(plan)):
+        raise ValueError("Frozen plan does not match its registered contents")
+    root = Path(plan["root"]).expanduser()
+    if not root.is_absolute() or root.resolve() != root:
+        raise ValueError("The original library root changed or became a symbolic link")
+    if not root_row or root != Path(root_row[0]).resolve():
+        raise ValueError("Frozen plan belongs to a different library")
+    settings_state = state_dir or path.parent
+    expected_recipe = recipe_digest(settings_state)
+    if plan.get("recipe_digest") != expected_recipe:
+        raise ValueError("Folder settings changed or this plan predates folder settings. Analyze the folder again before continuing.")
+    for item in plan["items"]:
+        security.relative(item["relpath"])
+        target = item.get("target", {}).get("final_relpath")
+        if target:
+            security.relative(target)
+        if item.get("executable"):
+            security.inside(root, item["relpath"])
+            if target:
+                security.inside(root, target)
     return plan
 
 
 def verify_source_against_item(root: Path, item: dict[str, Any]) -> tuple[bool, str]:
-    path = root / item["relpath"]
-    if not path.exists(): return False, "source_missing"
-    if not path.is_file(): return False, "source_not_regular_file"
-    st = path.stat()
-    if int(st.st_size) != int(item["source_size"]): return False, "source_size_changed"
-    planned_mtime = int(item.get("source_mtime_ns") or 0)
-    if planned_mtime and abs(int(st.st_mtime_ns) - planned_mtime) > 1_000_000:
-        return False, "source_mtime_changed"
-    qh = audit.quick_hash(path)
-    if item.get("source_quick_hash") and qh != item["source_quick_hash"]:
-        return False, "source_quick_hash_changed"
-    return True, "source_verified"
+    try:
+        path = security.inside(root, item["relpath"])
+        if not path.is_file(): return False, "source_missing_or_not_regular"
+        st = path.stat()
+        if int(st.st_size) != int(item["source_size"]): return False, "source_size_changed"
+        planned_mtime = int(item.get("source_mtime_ns") or 0)
+        if planned_mtime and abs(int(st.st_mtime_ns) - planned_mtime) > 1_000_000:
+            return False, "source_mtime_changed"
+        if not item.get("source_full_hash"):
+            return False, "plan_requires_fresh_analysis"
+        if security.digest(path) != item["source_full_hash"]:
+            return False, "source_content_changed"
+        return True, "source_verified"
+    except (ValueError, OSError) as exc:
+        return False, "source_path_unsafe"
 
 
 def target_dimensions(width: int, height: int, max_mp: float) -> tuple[int, int]:
@@ -1853,13 +2372,30 @@ def run_personal_tag_probe(root: Path, stage_dir: Path, probe: dict[str, Any], c
     }
 
 
-def convert_image_stage(src: Path, dst: Path, item: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+def convert_image_pixels(src: Path, dst: Path, item: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+    if not security._WORKER:
+        raise RuntimeError("Image decoding requires a restricted worker")
     from PIL import Image
-    root_name = Path(item["relpath"]).parts[0]
-    max_mp = float(item.get("target", {}).get("max_megapixels") or (cfg.get("streams_image_max_megapixels", 10) if root_name == "Streams" else cfg.get("photo_library_max_megapixels", 20)))
+    max_mp = float(item.get("target", {}).get("max_megapixels") or cfg.get("image_max_megapixels", 20))
     fmt = item.get("target", {}).get("format", "jpeg")
-    quality = int(cfg.get("streams_jpeg_quality", 50) if root_name == "Streams" else cfg.get("photo_library_jpeg_quality", 70))
-    with Image.open(src) as im:
+    quality = int(cfg.get("jpeg_quality", 70))
+    # Decode the input before creating output. Only errors in this input phase
+    # are file-local skips; output, metadata and verification errors still stop
+    # the controller before any replacement from that window is committed.
+    try:
+        im = Image.open(src, formats=security.pillow_formats())
+        try:
+            if im.width * im.height > 100_000_000:
+                raise ValueError("Image exceeds the processing safety limit")
+            im.load()
+        except BaseException:
+            im.close()
+            raise
+    except (OSError, SyntaxError) as exc:
+        return {"source_unreadable": True, "error": str(exc)[:400]}
+    with im:
+        if im.width * im.height > 100_000_000:
+            raise ValueError("Image exceeds the processing safety limit")
         source_format = im.format
         source_size = im.size
         out_wh = target_dimensions(im.width, im.height, max_mp)
@@ -1871,29 +2407,72 @@ def convert_image_stage(src: Path, dst: Path, item: dict[str, Any], cfg: dict[st
         save_kw: dict[str, Any] = {}
         if exif: save_kw["exif"] = exif
         if icc: save_kw["icc_profile"] = icc
+        xmp = im.info.get("xmp") or im.info.get("XML:com.adobe.xmp") or b""
+        if isinstance(xmp, str):
+            xmp = xmp.encode("utf-8")
         dst.parent.mkdir(parents=True, exist_ok=True)
         if fmt == "png":
+            from PIL import PngImagePlugin
+            text = PngImagePlugin.PngInfo()
+            for key in ("Creation Time", "creation_time", "date:create"):
+                if im.info.get(key):
+                    text.add_text(key, str(im.info[key]))
+            if xmp:
+                text.add_itxt("XML:com.adobe.xmp", xmp.decode("utf-8"))
+            save_kw["pnginfo"] = text
             dst = dst.with_suffix(".png")
             work.save(dst, format="PNG", optimize=True, **save_kw)
         else:
+            embedded = audit.embedded_image_date(im)
+            if embedded.get("embedded_date_field") in {"Creation Time", "creation_time", "date:create"}:
+                # PNG text dates have no JPEG text equivalent. Carry the same
+                # value in standard XMP so a subsequent scan can still read it.
+                from xml.sax.saxutils import quoteattr
+                value = quoteattr(embedded["embedded_creation_time"])
+                if xmp:
+                    close = re.search(rb"</([A-Za-z_][\w.-]*):RDF\s*>", xmp)
+                    if close is None:
+                        raise RuntimeError("Existing XMP cannot safely carry the embedded date")
+                    prefix = close.group(1).decode("ascii")
+                    addition = f'<{prefix}:Description xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:CreateDate={value}/>'.encode()
+                    xmp = xmp[:close.start()] + addition + xmp[close.start():]
+                else:
+                    xmp = ('<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+                           f'<rdf:Description xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:CreateDate={value}/>'
+                           '</rdf:RDF></x:xmpmeta>').encode()
+            if xmp:
+                save_kw["xmp"] = xmp
             dst = dst.with_suffix(".jpg")
             if work.mode not in ("RGB", "L"):
                 # Non-alpha image formats may still decode to palette/CMYK. Alpha is planned as PNG.
                 if "A" in work.getbands():
                     raise RuntimeError("unexpected_alpha_for_jpeg_target")
                 work = work.convert("RGB")
-            work.save(dst, format="JPEG", quality=quality, optimize=True, **save_kw)
+            work.save(dst, format="JPEG", quality=quality, optimize=True, progressive=True, **save_kw)
+    return {"output_path": str(dst), "source_format": source_format, "source_dimensions": source_size, "target_dimensions": out_wh}
+
+
+class SourceUnreadableError(RuntimeError):
+    pass
+
+
+def convert_image_stage(src: Path, dst: Path, item: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+    dst = dst.with_suffix(".png" if item.get("target", {}).get("format") == "png" else ".jpg")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    result = security.image_request("convert", {"source": str(src), "destination": str(dst), "item": item, "config": cfg}, reads=[src], writes=[dst])
+    if result.get("source_unreadable") is True:
+        raise SourceUnreadableError(result.get("error") or "The original image could not be decoded")
     tag_copy = (True, "disabled", [])
     if cfg.get("stage_copy_personal_finder_tags", True):
         tag_copy = copy_personal_finder_tags_xattr(src, dst, cfg)
     fs_restore = restore_stage_filesystem_metadata(src, dst)
-    return {"output_path": str(dst), "source_format": source_format, "source_dimensions": source_size, "target_dimensions": out_wh, "finder_tags_copy": tag_copy, "filesystem_restore": fs_restore}
+    return {**result, "output_path": str(dst), "finder_tags_copy": tag_copy, "filesystem_restore": fs_restore}
 
 
 def ffprobe_json(path: Path) -> dict[str, Any]:
-    ffprobe = shutil.which("ffprobe")
+    ffprobe = security.resolve_tool("ffprobe")
     if not ffprobe: raise RuntimeError("ffprobe_not_found")
-    p = subprocess.run([ffprobe, "-v", "error", "-show_streams", "-show_format", "-show_chapters", "-of", "json", str(path)], capture_output=True, text=True)
+    p = security.bounded_run([ffprobe, "-v", "error", "-show_streams", "-show_format", "-show_chapters", "-of", "json", str(path)], reads=[path])
     if p.returncode != 0: raise RuntimeError("ffprobe_failed:" + p.stderr.strip())
     return json.loads(p.stdout)
 
@@ -1910,7 +2489,7 @@ def duration_from_probe(info: dict[str, Any]) -> Optional[float]:
 
 
 def convert_video_stage(src: Path, dst: Path, item: dict[str, Any], cfg: dict[str, Any], package_dir: Path) -> dict[str, Any]:
-    hb = shutil.which("HandBrakeCLI")
+    hb = security.resolve_tool("HandBrakeCLI")
     if not hb: raise RuntimeError("HandBrakeCLI_not_found")
     preset_ref = Path(item.get("target", {}).get("preset") or cfg.get("video_preset_file", "preset-720P.json"))
     preset_path = preset_ref if preset_ref.is_absolute() else package_dir / preset_ref
@@ -1963,7 +2542,7 @@ def convert_video_stage(src: Path, dst: Path, item: dict[str, Any], cfg: dict[st
         *picture_args,
         "-i", str(src), "-o", str(dst),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = security.bounded_run(cmd, timeout=12*60*60, reads=[src, preset_path], writes=[dst])
     if proc.returncode != 0:
         raise RuntimeError("HandBrakeCLI_failed:" + proc.stderr[-3000:].strip())
     tag_copy = (True, "disabled", [])
@@ -1985,11 +2564,11 @@ def convert_video_stage(src: Path, dst: Path, item: dict[str, Any], cfg: dict[st
 
 
 def convert_audio_stage(src: Path, dst: Path, item: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = security.resolve_tool("ffmpeg")
     if not ffmpeg: raise RuntimeError("ffmpeg_not_found")
     dst = dst.with_suffix(".mp3")
     dst.parent.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(src), "-vn", "-c:a", "libmp3lame", "-b:a", "128k", str(dst)], capture_output=True, text=True)
+    proc = security.bounded_run([ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-i", str(src), "-vn", "-c:a", "libmp3lame", "-b:a", "128k", "-ac", "2", "-ar", "44100", str(dst)], timeout=2*60*60, reads=[src], writes=[dst])
     if proc.returncode != 0: raise RuntimeError("ffmpeg_failed:" + proc.stderr[-3000:].strip())
     tag_copy = (True, "disabled", [])
     if cfg.get("stage_copy_personal_finder_tags", True): tag_copy = copy_personal_finder_tags_xattr(src, dst, cfg)
@@ -2009,8 +2588,10 @@ def filesystem_metadata(path: Path) -> dict[str, Any]:
 
 
 def image_metadata(path: Path) -> dict[str, Any]:
+    if not security._WORKER:
+        return security.image_request("metadata", {"source": str(path)}, reads=[path])
     from PIL import Image
-    with Image.open(path) as im:
+    with Image.open(path, formats=security.pillow_formats()) as im:
         exif_blob = im.info.get("exif") or b""
         icc = im.info.get("icc_profile") or b""
         exif = im.getexif()
@@ -2034,6 +2615,8 @@ def image_metadata(path: Path) -> dict[str, Any]:
             "exif_datetime_original": ev(36867),
             "exif_datetime_digitized": ev(36868),
             "gps_present": bool(exif.get_ifd(34853)) if 34853 in exif else False,
+            "embedded_date": (date.isoformat() if (date := audit.parse_embedded_date(
+                audit.embedded_image_date(im).get("embedded_creation_time"))) else None),
         }
 
 
@@ -2235,16 +2818,16 @@ def video_frame_timing_summary(path: Path) -> dict[str, Any]:
     source might be VFR. It preserves timestamp order (no sorting/deduplication) so
     duplicate or backwards PTS remain visible as anomalies.
     """
-    ffprobe = shutil.which("ffprobe")
+    ffprobe = security.resolve_tool("ffprobe")
     if not ffprobe:
         raise RuntimeError("ffprobe_not_found")
-    p = subprocess.run(
+    p = security.bounded_run(
         [
             ffprobe, "-v", "error", "-select_streams", "v:0",
             "-show_entries", "frame=best_effort_timestamp_time:stream=nb_frames",
             "-of", "json", str(path),
         ],
-        capture_output=True, text=True,
+        timeout=120, max_output=32*1024*1024, reads=[path],
     )
     if p.returncode != 0:
         raise RuntimeError("ffprobe_frame_timing_failed:" + p.stderr.strip())
@@ -2407,7 +2990,9 @@ def is_droppable_camera_metadata_stream(stream: dict[str, Any]) -> bool:
     commonly appear in phone/camera captures as timed metadata, sensor data, or
     other auxiliary data and are not preserved by the MP4 optimization pipeline.
     """
-    return stream.get("codec_type") == "data"
+    return (stream.get("codec_type") == "data"
+            and str(stream.get("codec_tag_string") or "").lower() == "mebx"
+            and str((stream.get("tags") or {}).get("handler_name") or "").lower() == "core media metadata")
 
 
 def camera_metadata_drop_allowed(
@@ -2543,9 +3128,7 @@ def verify_staged_output(src: Path, out: Path, item: dict[str, Any], cfg: dict[s
     op = item["operation"]
     try:
         if op == "CONVERT_IMAGE":
-            from PIL import Image
-            with Image.open(out) as oi:
-                oi.verify()
+            security.image_request("verify", {"source": str(out)}, reads=[out])
             src_im = image_metadata(src); out_im = image_metadata(out)
             v["source_image"] = src_im; v["output_image"] = out_im
             v["output_dimensions"] = out_im["dimensions"]
@@ -2556,8 +3139,16 @@ def verify_staged_output(src: Path, out: Path, item: dict[str, Any], cfg: dict[s
             v["icc_profile_preserved"] = src_im["icc_sha256"] == out_im["icc_sha256"]
             v["exif_blob_preserved"] = src_im["exif_sha256"] == out_im["exif_sha256"]
             v["exif_orientation_preserved"] = src_im["exif_orientation"] == out_im["exif_orientation"]
+            v["embedded_date_preserved"] = src_im.get("embedded_date") == out_im.get("embedded_date")
+            if not v["embedded_date_preserved"]:
+                return "FAILED", v | {"error": "embedded_date_changed"}
         elif op in {"CONVERT_VIDEO", "CONVERT_AUDIO"}:
             sinfo = ffprobe_json(src); oinfo = ffprobe_json(out)
+            source_date = audit.parse_embedded_date(audit.embedded_av_date(sinfo).get("embedded_creation_time"))
+            output_date = audit.parse_embedded_date(audit.embedded_av_date(oinfo).get("embedded_creation_time"))
+            v["embedded_date_preserved"] = source_date is None or source_date == output_date
+            if not v["embedded_date_preserved"]:
+                return "FAILED", v | {"error": "embedded_date_changed"}
             sd = duration_from_probe(sinfo); od = duration_from_probe(oinfo)
             v["source_duration"] = sd; v["output_duration"] = od
             if sd is not None and od is not None:
@@ -2823,17 +3414,19 @@ def validate_stage_limits(args: argparse.Namespace) -> None:
         raise SystemExit("--max-audio must be between 0 and 10")
 
 
+@security.state_operation
 def cmd_stage(args: argparse.Namespace) -> int:
     validate_stage_limits(args)
     plan_path = Path(args.plan).expanduser().resolve()
-    plan = load_plan(plan_path)
+    plan = load_plan(plan_path, Path(args.state_dir).expanduser().resolve())
     root = Path(plan["root"]).resolve()
     if not root.is_dir(): raise SystemExit(f"Plan root is unavailable: {root}")
     state_dir = Path(args.state_dir).expanduser().resolve()
     db_path = state_dir / "media-maintenance.sqlite"
     if not db_path.exists(): raise SystemExit(f"State database not found: {db_path}")
-    cfg = load_config(Path(args.config).expanduser() if args.config else None)
-    cfg = apply_product_settings(cfg, state_dir)
+    # Conversion uses exactly the configuration approved during analysis.
+    # load_plan already checked the independently stored current folder recipe.
+    cfg = json.loads(json.dumps(plan["config_snapshot"]))
     package_dir = Path(__file__).resolve().parent
     # Ensure plan is the exact plan registered in DB.
     con = init_db(db_path, root); con.row_factory = sqlite3.Row
@@ -2841,7 +3434,7 @@ def cmd_stage(args: argparse.Namespace) -> int:
     if not dbplan: raise SystemExit("Plan is not registered in this state database")
     staging_id = sha256_text(canonical_json({"plan_id": plan["plan_id"], "started": now_iso()}))[:16]
     stage_dir = state_dir / "staging" / staging_id
-    stage_dir.mkdir(parents=True, exist_ok=False)
+    security.ensure_parent(stage_dir / ".directory-anchor", state_dir, exclusive=True)
     con.execute("INSERT INTO staging_runs(staging_id,plan_id,started_at,status,staging_dir) VALUES(?,?,?,?,?)", (staging_id,plan["plan_id"],now_iso(),"RUNNING",str(stage_dir)))
     con.commit()
     limits = {"CONVERT_IMAGE": int(args.max_images), "CONVERT_VIDEO": int(args.max_videos), "CONVERT_AUDIO": int(args.max_audio)}
@@ -2850,7 +3443,7 @@ def cmd_stage(args: argparse.Namespace) -> int:
     assets = asset_metadata_map(con)
     committed_before = already_committed_relpaths(db_path)
     resolved_before = resolved_keep_original_relpaths(con, plan["plan_id"])
-    excluded_before = committed_before | resolved_before
+    excluded_before = committed_before | resolved_before | unreadable_source_relpaths(con, plan["plan_id"])
     selected = select_stage_items(plan, limits, args.sample_strategy, assets, root, cfg, excluded_before)
     expected_video_policy = str((cfg.get("policies") or {}).get("streams_video") or "")
     mismatched_video = [i for i in selected if i.get("operation") == "CONVERT_VIDEO" and str(i.get("policy_version") or "") != expected_video_policy]
@@ -2882,7 +3475,7 @@ def cmd_stage(args: argparse.Namespace) -> int:
         print(f"Tag probe: {tag_probe['relpath']} tags={tag_probe['personal_tags']}")
     results=[]
     for idx,item in enumerate(selected,1):
-        src=root/item["relpath"]
+        src=security.inside(root,item["relpath"])
         ok, why=verify_source_against_item(root,item)
         rec={"relpath":item["relpath"],"operation":item["operation"],"status":"", "source_verification":why,
              "sample_reason":item.get("sample_reason","unspecified"), "policy_version":item.get("policy_version")}
@@ -2920,14 +3513,24 @@ def cmd_stage(args: argparse.Namespace) -> int:
         marker=(item.get("source_quick_hash") or "nohash")[:8]
         outbase=stage_dir/"outputs"/rel.parent/f"{rel.stem}.__stage_{marker}{rel.suffix}"
         try:
+            security.ensure_parent(outbase, stage_dir)
             if item["operation"]=="CONVERT_IMAGE": meta=convert_image_stage(src,outbase,item,cfg)
             elif item["operation"]=="CONVERT_VIDEO": meta=convert_video_stage(src,outbase,item,cfg,package_dir)
             else: meta=convert_audio_stage(src,outbase,item,cfg)
-            out=Path(meta["output_path"])
+            out=security.inside(stage_dir, Path(meta["output_path"]).relative_to(stage_dir))
             status,verification=verify_staged_output(src,out,item,cfg)
+            verification["staged_sha256"] = security.digest(out)
+            verification["source_full_hash"] = item["source_full_hash"]
             rec.update(status=status, output_path=str(out), conversion=meta, verification=verification)
             print(f"[{idx}/{len(selected)}] {status:<15} {item['relpath']}  {verification.get('saving_percent',0):.1f}%")
             emit_event("stage_item", index=idx, total=len(selected), relpath=item["relpath"], operation=item["operation"], status=status, saving_percent=verification.get("saving_percent",0))
+        except SourceUnreadableError as exc:
+            unchanged, why = verify_source_against_item(root, item)
+            rec["status"] = "SOURCE_UNREADABLE" if unchanged else "STALE_PLAN"
+            rec["error"] = str(exc) if unchanged else why
+            print(f"[{idx}/{len(selected)}] {rec['status']} {item['relpath']} — original left unchanged")
+            emit_event("stage_item", index=idx, total=len(selected), relpath=item["relpath"],
+                       operation=item["operation"], status=rec["status"], error=rec["error"])
         except Exception as exc:
             rec["status"]="FAILED"; rec["error"]=str(exc)
             print(f"[{idx}/{len(selected)}] FAILED          {item['relpath']} ({exc})")
@@ -3003,9 +3606,9 @@ def cmd_stage(args: argparse.Namespace) -> int:
             item = selected_by_rel.get(r.get("relpath"))
             if item is not None:
                 con.execute(
-                    "INSERT OR IGNORE INTO disposition_history(asset_id,plan_id,policy_version,operation,disposition,decided_at,source_quick_hash,source_size,details_json) VALUES(?,?,?,?,?,?,?,?,?)",
+                    "INSERT OR REPLACE INTO disposition_history(asset_id,plan_id,policy_version,operation,disposition,decided_at,source_quick_hash,source_size,details_json) VALUES(?,?,?,?,?,?,?,?,?)",
                     (item.get("asset_id"), plan["plan_id"], item.get("policy_version"), item.get("operation"),
-                     "KEEP_ORIGINAL", now_iso(), item.get("source_quick_hash"), item.get("source_size"), canonical_json(ver)),
+                     "KEEP_ORIGINAL", now_iso(), item.get("source_quick_hash"), item.get("source_size"), canonical_json({**ver, "recipe_digest": plan.get("recipe_digest")})),
                 )
     con.execute("UPDATE staging_runs SET completed_at=?,status=?,report_path=? WHERE staging_id=?",(now_iso(),"COMPLETE",str(report_md),staging_id)); con.commit(); con.close()
     print("Results: " + ", ".join(f"{k}={v}" for k,v in rc.items()))
@@ -3050,7 +3653,8 @@ def find_plan_item(plan: dict[str, Any], relpath: str) -> Optional[dict[str, Any
 
 
 def load_staging_report(state_dir: Path, staging_id: str) -> dict[str, Any]:
-    path = state_dir / f"staging-{staging_id}.json"
+    security.identifier(staging_id)
+    path = security.inside(state_dir, f"staging-{staging_id}.json")
     if not path.exists():
         raise SystemExit(f"Staging report not found: {path}")
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -3073,6 +3677,29 @@ def choose_commit_candidate(report: dict[str, Any], relpath: Optional[str]) -> d
     return candidates[0]
 
 
+def destination_is_occupied(source: Path, destination: Path) -> bool:
+    """Allow a case-only alias of the source, never another directory entry.
+
+    samefile alone is insufficient: distinct hard links can share an inode.
+    A case-insensitive alias has no separate entry with the destination spelling.
+    Broken symlinks also count as occupied destinations.
+    """
+    if destination == source or not os.path.lexists(destination):
+        return False
+    if destination.is_symlink():
+        return True
+    try:
+        if (source.name.casefold() == destination.name.casefold()
+                and source.parent.samefile(destination.parent)
+                and source.samefile(destination)):
+            with os.scandir(destination.parent) as entries:
+                return any(entry.name == destination.name for entry in entries)
+    except OSError:
+        pass
+    return True
+
+
+@security.state_operation
 def commit_one(args: argparse.Namespace, quiet: bool = False) -> dict[str, Any]:
     if not args.yes:
         raise SystemExit("Commit requires --yes. This command changes one file in Media and quarantines the original.")
@@ -3087,8 +3714,9 @@ def commit_one(args: argparse.Namespace, quiet: bool = False) -> dict[str, Any]:
         raise SystemExit(f"Frozen plan JSON not found for plan {plan_id}")
     plan = load_plan(plan_candidates[-1])
     root = Path(plan["root"]).resolve()
-    cfg = load_config(Path(args.config).expanduser() if args.config else None)
-    cfg = apply_product_settings(cfg, state_dir)
+    # Conversion uses exactly the configuration approved during analysis.
+    # load_plan already checked the independently stored current folder recipe.
+    cfg = json.loads(json.dumps(plan["config_snapshot"]))
     if root.stat().st_dev != state_dir.stat().st_dev:
         raise SystemExit("v0.4.0 requires Media and the state directory to be on the same filesystem for atomic quarantine/rollback")
     staged = choose_commit_candidate(report, args.relpath)
@@ -3096,7 +3724,7 @@ def commit_one(args: argparse.Namespace, quiet: bool = False) -> dict[str, Any]:
     item = find_plan_item(plan, relpath)
     if not item or item.get("operation") != "CONVERT_IMAGE" or not item.get("executable"):
         raise SystemExit("Plan item is no longer an executable image conversion")
-    source = root / relpath
+    source = security.inside(root, relpath)
     staged_path = Path(staged.get("output_path", "")).resolve()
     if not staged_path.is_file():
         raise SystemExit(f"Staged output missing: {staged_path}")
@@ -3114,16 +3742,22 @@ def commit_one(args: argparse.Namespace, quiet: bool = False) -> dict[str, Any]:
     final_rel = Path(final_relpath)
     if final_rel.is_absolute() or ".." in final_rel.parts:
         raise SystemExit("Refusing commit: invalid final_relpath in frozen plan")
-    final_path = root / final_rel
-    if final_path != source and final_path.exists():
+    final_path = security.inside(root, final_rel)
+    if destination_is_occupied(source, final_path):
         raise SystemExit(f"Refusing commit: destination already exists: {final_path}")
 
     original_sha = sha256_file(source)
     staged_sha = sha256_file(staged_path)
+    with security.database(db_path) as stage_db:
+        frozen_stage = stage_db.execute("SELECT verification_json FROM staging_items WHERE staging_id=? AND relpath=?", (args.staging_id, item["relpath"])).fetchone()
+    if not frozen_stage or json.loads(frozen_stage[0]).get("staged_sha256") != staged_sha:
+        raise ValueError("Staged content changed or predates safety verification. Analyze and stage again.")
+    if original_sha != item["source_full_hash"]:
+        raise ValueError("Source changed since staging")
     commit_id = sha256_text(canonical_json({"staging_id": args.staging_id, "relpath": relpath, "started": now_iso()}))[:16]
     quarantine_dir = state_dir / "quarantine" / commit_id
-    quarantine_path = quarantine_dir / relpath
-    quarantine_path.parent.mkdir(parents=True, exist_ok=False)
+    quarantine_path = security.inside(state_dir, f"quarantine/{commit_id}/{relpath}")
+    security.ensure_parent(quarantine_path, state_dir, exclusive=True)
 
     con = init_db(db_path, root)
     con.row_factory = sqlite3.Row
@@ -3155,6 +3789,7 @@ def commit_one(args: argparse.Namespace, quiet: bool = False) -> dict[str, Any]:
     final_tmp = final_path.parent / f".{final_path.name}.media-maintenance-{commit_id}.tmp"
     moved_to_quarantine = False
     installed = False
+    installed = False
     details: dict[str, Any] = {
         "precommit_verification": verification,
         "asset_id": asset_id,
@@ -3162,13 +3797,16 @@ def commit_one(args: argparse.Namespace, quiet: bool = False) -> dict[str, Any]:
         "final_relpath": final_relpath,
         "policy_version": item.get("policy_version"),
     }
+    security.journal_begin(state_dir, root, commit_id, source, final_path, quarantine_path, original_sha, staged_sha, item["operation"])
     try:
         # Atomic move of the original out of Media; never delete it.
-        os.replace(source, quarantine_path)
+        security.move_no_replace(source, quarantine_path, root, state_dir)
         moved_to_quarantine = True
+        if security.digest(quarantine_path) != original_sha:
+            raise RuntimeError("source_changed_during_quarantine")
         fsync_dir(source.parent); fsync_dir(quarantine_path.parent)
         # Copy staged bytes into a same-directory temp, then atomically install.
-        shutil.copyfile(staged_path, final_tmp)
+        security.copy_new(staged_path, final_tmp, state_dir, root)
         fsync_file(final_tmp)
         # Reapply staged filesystem metadata and personal tags to the temp copy.
         st = staged_path.stat()
@@ -3183,8 +3821,8 @@ def commit_one(args: argparse.Namespace, quiet: bool = False) -> dict[str, Any]:
             tag_ok, tag_msg, copied = True, "no_personal_tags", []
         if sha256_file(final_tmp) != staged_sha:
             raise RuntimeError("temp_copy_hash_mismatch")
-        final_path.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(final_tmp, final_path)
+        security.ensure_parent(final_path, root)
+        security.move_no_replace(final_tmp, final_path, root, root)
         installed = True
         fsync_dir(final_path.parent)
         final_sha = sha256_file(final_path)
@@ -3195,6 +3833,8 @@ def commit_one(args: argparse.Namespace, quiet: bool = False) -> dict[str, Any]:
         if final_status != "STAGED_VERIFIED" or final_ver.get("metadata_ready_for_commit") is not True:
             raise RuntimeError(f"final_media_verification_failed:{final_status}")
 
+        if security.digest(quarantine_path) != original_sha:
+            raise RuntimeError("source_changed_during_verification")
         fst = final_path.stat()
         con.execute(
             "UPDATE assets SET relpath=?,size=?,mtime_ns=?,birth_ts=?,quick_hash=?,full_hash=?,"
@@ -3242,6 +3882,7 @@ def commit_one(args: argparse.Namespace, quiet: bool = False) -> dict[str, Any]:
             print(f"Original quarantine: {quarantine_path}")
             print(f"Report: {report_path}")
             print(f"Commit ID: {commit_id}")
+        security.journal_done(state_dir, commit_id)
         return result
     except Exception as exc:
         # Best-effort automatic rollback: remove/move installed candidate, restore original.
@@ -3250,11 +3891,12 @@ def commit_one(args: argparse.Namespace, quiet: bool = False) -> dict[str, Any]:
             if final_tmp.exists():
                 final_tmp.unlink()
             if moved_to_quarantine and quarantine_path.exists():
-                if final_path.exists():
+                if installed and final_path.exists():
                     failed_dir = state_dir / "failed-commit-output" / commit_id / final_relpath
-                    failed_dir.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(final_path, failed_dir)
-                os.replace(quarantine_path, source)
+                    security.ensure_parent(failed_dir, state_dir)
+                    security.move_no_replace(final_path, failed_dir, root, state_dir)
+                    installed = False
+                security.move_no_replace(quarantine_path, source, state_dir, root)
                 fsync_dir(source.parent)
                 restored_sha = sha256_file(source)
                 if restored_sha != original_sha:
@@ -3269,6 +3911,8 @@ def commit_one(args: argparse.Namespace, quiet: bool = False) -> dict[str, Any]:
             con.commit(); con.close()
         raise SystemExit(f"Commit failed safely: {rollback_note}")
     finally:
+        if source.is_file() and not quarantine_path.exists() and not installed:
+            security.journal_done(state_dir, commit_id)
         try:
             con.close()
         except Exception:
@@ -3292,6 +3936,7 @@ def choose_audio_commit_candidate(report: dict[str, Any], relpath: str) -> dict[
     return candidates[0]
 
 
+@security.state_operation
 def commit_one_audio(args: argparse.Namespace, quiet: bool = False) -> dict[str, Any]:
     if not args.yes:
         raise SystemExit(
@@ -3314,8 +3959,9 @@ def commit_one_audio(args: argparse.Namespace, quiet: bool = False) -> dict[str,
 
     plan = load_plan(plan_candidates[-1])
     root = Path(plan["root"]).resolve()
-    cfg = load_config(Path(args.config).expanduser() if args.config else None)
-    cfg = apply_product_settings(cfg, state_dir)
+    # Conversion uses exactly the configuration approved during analysis.
+    # load_plan already checked the independently stored current folder recipe.
+    cfg = json.loads(json.dumps(plan["config_snapshot"]))
 
     if root.stat().st_dev != state_dir.stat().st_dev:
         raise SystemExit(
@@ -3356,7 +4002,7 @@ def commit_one_audio(args: argparse.Namespace, quiet: bool = False) -> dict[str,
             + ", ".join(f"{k}={v}" for k, v in policies.items())
         )
 
-    source = root / relpath
+    source = security.inside(root, relpath)
     staged_path = Path(staged.get("output_path", "")).resolve()
 
     if not staged_path.is_file():
@@ -3396,15 +4042,21 @@ def commit_one_audio(args: argparse.Namespace, quiet: bool = False) -> dict[str,
             "Refusing audio commit: invalid final_relpath in frozen plan"
         )
 
-    final_path = root / final_rel
+    final_path = security.inside(root, final_rel)
 
-    if final_path != source and final_path.exists():
+    if destination_is_occupied(source, final_path):
         raise SystemExit(
             f"Refusing audio commit: destination already exists: {final_path}"
         )
 
     original_sha = sha256_file(source)
     staged_sha = sha256_file(staged_path)
+    with security.database(db_path) as stage_db:
+        frozen_stage = stage_db.execute("SELECT verification_json FROM staging_items WHERE staging_id=? AND relpath=?", (args.staging_id, item["relpath"])).fetchone()
+    if not frozen_stage or json.loads(frozen_stage[0]).get("staged_sha256") != staged_sha:
+        raise ValueError("Staged content changed or predates safety verification. Analyze and stage again.")
+    if original_sha != item["source_full_hash"]:
+        raise ValueError("Source changed since staging")
 
     commit_id = sha256_text(
         canonical_json(
@@ -3418,8 +4070,8 @@ def commit_one_audio(args: argparse.Namespace, quiet: bool = False) -> dict[str,
     )[:16]
 
     quarantine_dir = state_dir / "quarantine" / commit_id
-    quarantine_path = quarantine_dir / relpath
-    quarantine_path.parent.mkdir(parents=True, exist_ok=False)
+    quarantine_path = security.inside(state_dir, f"quarantine/{commit_id}/{relpath}")
+    security.ensure_parent(quarantine_path, state_dir, exclusive=True)
 
     con = init_db(db_path, root)
     con.row_factory = sqlite3.Row
@@ -3470,6 +4122,7 @@ def commit_one_audio(args: argparse.Namespace, quiet: bool = False) -> dict[str,
         / f".{final_path.name}.media-maintenance-{commit_id}.tmp"
     )
     moved_to_quarantine = False
+    installed = False
 
     details: dict[str, Any] = {
         "precommit_verification": verification,
@@ -3479,17 +4132,20 @@ def commit_one_audio(args: argparse.Namespace, quiet: bool = False) -> dict[str,
         "policy_version": item.get("policy_version"),
     }
 
+    security.journal_begin(state_dir, root, commit_id, source, final_path, quarantine_path, original_sha, staged_sha, item["operation"])
     try:
-        final_path.parent.mkdir(parents=True, exist_ok=True)
+        security.ensure_parent(final_path, root)
 
         # Original leaves the library atomically but is never deleted.
-        os.replace(source, quarantine_path)
+        security.move_no_replace(source, quarantine_path, root, state_dir)
         moved_to_quarantine = True
+        if security.digest(quarantine_path) != original_sha:
+            raise RuntimeError("source_changed_during_quarantine")
         fsync_dir(source.parent)
         fsync_dir(quarantine_path.parent)
 
         # Install a separately verified staged copy.
-        shutil.copyfile(staged_path, final_tmp)
+        security.copy_new(staged_path, final_tmp, state_dir, root)
         fsync_file(final_tmp)
 
         st = staged_path.stat()
@@ -3513,7 +4169,8 @@ def commit_one_audio(args: argparse.Namespace, quiet: bool = False) -> dict[str,
         if sha256_file(final_tmp) != staged_sha:
             raise RuntimeError("temp_copy_hash_mismatch")
 
-        os.replace(final_tmp, final_path)
+        security.move_no_replace(final_tmp, final_path, root, root)
+        installed = True
         fsync_dir(final_path.parent)
 
         final_sha = sha256_file(final_path)
@@ -3533,6 +4190,8 @@ def commit_one_audio(args: argparse.Namespace, quiet: bool = False) -> dict[str,
                 f"final_audio_verification_failed:{final_status}"
             )
 
+        if security.digest(quarantine_path) != original_sha:
+            raise RuntimeError("source_changed_during_verification")
         fst = final_path.stat()
 
         con.execute(
@@ -3658,6 +4317,7 @@ def commit_one_audio(args: argparse.Namespace, quiet: bool = False) -> dict[str,
             print(f"Report: {report_path}")
             print(f"Commit ID: {commit_id}")
 
+        security.journal_done(state_dir, commit_id)
         return result
 
     except Exception as exc:
@@ -3668,17 +4328,18 @@ def commit_one_audio(args: argparse.Namespace, quiet: bool = False) -> dict[str,
                 final_tmp.unlink()
 
             if moved_to_quarantine and quarantine_path.exists():
-                if final_path.exists():
+                if installed and final_path.exists():
                     failed = (
                         state_dir
                         / "failed-commit-output"
                         / commit_id
                         / final_relpath
                     )
-                    failed.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(final_path, failed)
+                    security.ensure_parent(failed, state_dir)
+                    security.move_no_replace(final_path, failed, root, state_dir)
+                    installed = False
 
-                os.replace(quarantine_path, source)
+                security.move_no_replace(quarantine_path, source, state_dir, root)
                 fsync_dir(source.parent)
 
                 if sha256_file(source) == original_sha:
@@ -3716,6 +4377,8 @@ def commit_one_audio(args: argparse.Namespace, quiet: bool = False) -> dict[str,
         )
 
     finally:
+        if source.is_file() and not quarantine_path.exists() and not installed:
+            security.journal_done(state_dir, commit_id)
         try:
             con.close()
         except Exception:
@@ -3733,6 +4396,7 @@ def choose_video_commit_candidate(report: dict[str, Any], relpath: str) -> dict[
     return candidates[0]
 
 
+@security.state_operation
 def commit_one_video(args: argparse.Namespace, quiet: bool = False) -> dict[str, Any]:
     if not args.yes:
         raise SystemExit("Video commit requires --yes. This command changes exactly one video in Media and quarantines the original.")
@@ -3747,8 +4411,9 @@ def commit_one_video(args: argparse.Namespace, quiet: bool = False) -> dict[str,
         raise SystemExit(f"Frozen plan JSON not found for plan {plan_id}")
     plan = load_plan(plan_candidates[-1])
     root = Path(plan["root"]).resolve()
-    cfg = load_config(Path(args.config).expanduser() if args.config else None)
-    cfg = apply_product_settings(cfg, state_dir)
+    # Conversion uses exactly the configuration approved during analysis.
+    # load_plan already checked the independently stored current folder recipe.
+    cfg = json.loads(json.dumps(plan["config_snapshot"]))
     if root.stat().st_dev != state_dir.stat().st_dev:
         raise SystemExit("Video commit requires Media and the state directory on the same filesystem for atomic quarantine/rollback")
 
@@ -3768,7 +4433,7 @@ def commit_one_video(args: argparse.Namespace, quiet: bool = False) -> dict[str,
     if len(set(policies.values())) != 1:
         raise SystemExit("Refusing video commit: policy mismatch: " + ", ".join(f"{k}={v}" for k,v in policies.items()))
 
-    source = root / item["relpath"]
+    source = security.inside(root, item["relpath"])
     staged_path = Path(staged.get("output_path", "")).resolve()
     if not staged_path.is_file():
         raise SystemExit(f"Staged output missing: {staged_path}")
@@ -3792,17 +4457,23 @@ def commit_one_video(args: argparse.Namespace, quiet: bool = False) -> dict[str,
     if final_rel.is_absolute() or ".." in final_rel.parts:
         raise SystemExit("Refusing video commit: invalid final_relpath in frozen plan")
     final_relpath = final_rel.as_posix()
-    final_path = root / final_rel
+    final_path = security.inside(root, final_rel)
 
-    if final_path != source and final_path.exists():
+    if destination_is_occupied(source, final_path):
         raise SystemExit(f"Refusing video commit: destination already exists: {final_path}")
 
     original_sha = sha256_file(source)
     staged_sha = sha256_file(staged_path)
+    with security.database(db_path) as stage_db:
+        frozen_stage = stage_db.execute("SELECT verification_json FROM staging_items WHERE staging_id=? AND relpath=?", (args.staging_id, item["relpath"])).fetchone()
+    if not frozen_stage or json.loads(frozen_stage[0]).get("staged_sha256") != staged_sha:
+        raise ValueError("Staged content changed or predates safety verification. Analyze and stage again.")
+    if original_sha != item["source_full_hash"]:
+        raise ValueError("Source changed since staging")
     commit_id = sha256_text(canonical_json({"staging_id": args.staging_id, "relpath": item["relpath"], "started": now_iso()}))[:16]
     quarantine_dir = state_dir / "quarantine" / commit_id
-    quarantine_path = quarantine_dir / item["relpath"]
-    quarantine_path.parent.mkdir(parents=True, exist_ok=False)
+    quarantine_path = security.inside(state_dir, f"quarantine/{commit_id}/{item['relpath']}")
+    security.ensure_parent(quarantine_path, state_dir, exclusive=True)
     con = init_db(db_path, root)
     asset_row = con.execute("SELECT asset_id FROM assets WHERE relpath=?", (item["relpath"],)).fetchone()
     if not asset_row:
@@ -3817,14 +4488,21 @@ def commit_one_video(args: argparse.Namespace, quiet: bool = False) -> dict[str,
     con.commit()
 
     final_tmp = final_path.parent / f".{final_path.name}.media-maintenance-{commit_id}.tmp"
+    installed = False
     moved_to_quarantine = False
+    installed = False
     details: dict[str, Any] = {"precommit_verification": verification, "policy_version": item_policy,
                                "asset_id": asset_id, "original_relpath": item["relpath"], "final_relpath": final_relpath}
+    security.journal_begin(state_dir, root, commit_id, source, final_path, quarantine_path, original_sha, staged_sha, item["operation"])
     try:
-        os.replace(source, quarantine_path)
+        security.move_no_replace(source, quarantine_path, root, state_dir)
         moved_to_quarantine = True
+        if security.digest(quarantine_path) != original_sha:
+            raise RuntimeError("source_changed_during_quarantine")
+        if security.digest(quarantine_path) != original_sha:
+            raise RuntimeError("source_changed_during_quarantine")
         fsync_dir(source.parent); fsync_dir(quarantine_path.parent)
-        shutil.copyfile(staged_path, final_tmp)
+        security.copy_new(staged_path, final_tmp, state_dir, root)
         fsync_file(final_tmp)
         st = staged_path.stat()
         set_creation_time(final_tmp, getattr(st, "st_birthtime", None))
@@ -3836,7 +4514,8 @@ def commit_one_video(args: argparse.Namespace, quiet: bool = False) -> dict[str,
                 raise RuntimeError(f"could_not_copy_personal_tags_to_final_temp:{tag_msg}")
         if sha256_file(final_tmp) != staged_sha:
             raise RuntimeError("temp_copy_hash_mismatch")
-        os.replace(final_tmp, final_path)
+        security.move_no_replace(final_tmp, final_path, root, root)
+        installed = True
         fsync_dir(final_path.parent)
         final_sha = sha256_file(final_path)
         if final_sha != staged_sha:
@@ -3850,6 +4529,8 @@ def commit_one_video(args: argparse.Namespace, quiet: bool = False) -> dict[str,
 
         # Transfer durable asset identity to the installed .mp4 path, then attach
         # processing history to that same asset_id so next year's planner can skip it.
+        if security.digest(quarantine_path) != original_sha:
+            raise RuntimeError("source_changed_during_verification")
         fst = final_path.stat()
         con.execute("UPDATE assets SET relpath=?,size=?,mtime_ns=?,birth_ts=?,quick_hash=?,full_hash=?,extension=?,video_codec=?,active=1 WHERE asset_id=?",
                     (final_relpath, int(fst.st_size), int(fst.st_mtime_ns), getattr(fst, "st_birthtime", None),
@@ -3891,17 +4572,19 @@ def commit_one_video(args: argparse.Namespace, quiet: bool = False) -> dict[str,
             print(f"Original quarantine: {quarantine_path}")
             print(f"Report: {report_path}")
             print(f"Commit ID: {commit_id}")
+        security.journal_done(state_dir, commit_id)
         return result
     except Exception as exc:
         rollback_note = str(exc)
         try:
             if final_tmp.exists(): final_tmp.unlink()
             if moved_to_quarantine and quarantine_path.exists():
-                if final_path.exists():
+                if installed and final_path.exists():
                     failed = state_dir / "failed-commit-output" / commit_id / final_relpath
-                    failed.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(final_path, failed)
-                os.replace(quarantine_path, source)
+                    security.ensure_parent(failed, state_dir)
+                    security.move_no_replace(final_path, failed, root, state_dir)
+                    installed = False
+                security.move_no_replace(quarantine_path, source, state_dir, root)
                 fsync_dir(source.parent)
                 if sha256_file(source) == original_sha:
                     rollback_note += "; original_restored"
@@ -3915,11 +4598,14 @@ def commit_one_video(args: argparse.Namespace, quiet: bool = False) -> dict[str,
             con.commit(); con.close()
         raise SystemExit(f"Video commit failed safely: {rollback_note}")
     finally:
+        if source.is_file() and not quarantine_path.exists() and not installed:
+            security.journal_done(state_dir, commit_id)
         try: con.close()
         except Exception: pass
 
 
 
+@security.state_operation
 def commit_one_rename(args: argparse.Namespace, quiet: bool = False) -> dict[str, Any]:
     if not args.yes:
         raise SystemExit(
@@ -3933,22 +4619,22 @@ def commit_one_rename(args: argparse.Namespace, quiet: bool = False) -> dict[str
         raise SystemExit(f"State database not found: {db_path}")
 
     plan_path = Path(args.plan).expanduser().resolve()
-    plan = load_plan(plan_path)
+    plan = load_plan(plan_path, Path(args.state_dir).expanduser().resolve())
     root = Path(plan["root"]).resolve()
 
     item = find_plan_item(plan, args.relpath)
     if not item or item.get("operation") != "RENAME" or not item.get("executable"):
         raise SystemExit("Plan item is not an executable rename")
 
-    source = root / item["relpath"]
+    source = security.inside(root, item["relpath"])
     final_relpath = str((item.get("target") or {}).get("final_relpath") or "")
     if not final_relpath:
         raise SystemExit("Rename plan item has no canonical final_relpath")
 
-    final_path = root / final_relpath
+    final_path = security.inside(root, final_relpath)
     if final_path == source:
         raise SystemExit("Rename destination is identical to source")
-    if final_path.exists():
+    if destination_is_occupied(source, final_path):
         raise SystemExit(f"Refusing rename commit: destination already exists: {final_path}")
 
     ok, why = verify_source_against_item(root, item)
@@ -3964,6 +4650,8 @@ def commit_one_rename(args: argparse.Namespace, quiet: bool = False) -> dict[str
         )
 
     original_sha = sha256_file(source)
+    if original_sha != item["source_full_hash"]:
+        raise ValueError("Source changed since planning")
     commit_id = sha256_text(
         canonical_json(
             {
@@ -3976,8 +4664,8 @@ def commit_one_rename(args: argparse.Namespace, quiet: bool = False) -> dict[str
     )[:16]
 
     quarantine_dir = state_dir / "quarantine" / commit_id
-    quarantine_path = quarantine_dir / item["relpath"]
-    quarantine_path.parent.mkdir(parents=True, exist_ok=False)
+    quarantine_path = security.inside(state_dir, f"quarantine/{commit_id}/{item['relpath']}")
+    security.ensure_parent(quarantine_path, state_dir, exclusive=True)
 
     con = init_db(db_path, root)
     con.row_factory = sqlite3.Row
@@ -4018,6 +4706,7 @@ def commit_one_rename(args: argparse.Namespace, quiet: bool = False) -> dict[str
 
     moved_to_quarantine = False
     installed = False
+    installed = False
 
     details = {
         "asset_id": asset_id,
@@ -4027,17 +4716,22 @@ def commit_one_rename(args: argparse.Namespace, quiet: bool = False) -> dict[str
         "filename_standardization": True,
     }
 
+    security.journal_begin(state_dir, root, commit_id, source, final_path, quarantine_path, original_sha, original_sha, "RENAME")
     try:
-        final_path.parent.mkdir(parents=True, exist_ok=True)
+        security.ensure_parent(final_path, root)
 
         # First move original into Veronica quarantine atomically.
-        os.replace(source, quarantine_path)
+        security.move_no_replace(source, quarantine_path, root, state_dir)
         moved_to_quarantine = True
+        if security.digest(quarantine_path) != original_sha:
+            raise RuntimeError("source_changed_during_quarantine")
+        if security.digest(quarantine_path) != original_sha:
+            raise RuntimeError("source_changed_during_quarantine")
         fsync_dir(source.parent)
         fsync_dir(quarantine_path.parent)
 
         # Then atomically install the exact same bytes at the canonical pathname.
-        os.replace(quarantine_path, final_path)
+        security.move_no_replace(quarantine_path, final_path, state_dir, root)
         installed = True
         fsync_dir(final_path.parent)
 
@@ -4045,13 +4739,13 @@ def commit_one_rename(args: argparse.Namespace, quiet: bool = False) -> dict[str
         if final_sha != original_sha:
             raise RuntimeError("rename_final_hash_mismatch")
 
-        # Put a byte-identical rollback copy back into quarantine.
-        #
-        # copy2 preserves ordinary filesystem metadata where supported, but macOS
-        # creation time is restored explicitly so rollback does not silently replace
-        # the asset's original birth date with the time the quarantine copy was made.
-        quarantine_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(final_path, quarantine_path)
+        # Retain the original metadata as well as its bytes. Python's copystat
+        # does not copy extended attributes on this macOS runtime; without the
+        # explicit copy, a restored rename loses Finder tags and resource forks.
+        security.ensure_parent(quarantine_path, state_dir)
+        security.copy_new(final_path, quarantine_path, root, state_dir)
+        from media_dates import copy_attributes
+        copy_attributes(final_path, quarantine_path)
 
         final_stat = final_path.stat()
         creation_ok, creation_msg = set_creation_time(
@@ -4062,6 +4756,8 @@ def commit_one_rename(args: argparse.Namespace, quiet: bool = False) -> dict[str
             raise RuntimeError(
                 f"rename_quarantine_creation_time_restore_failed:{creation_msg}"
             )
+        # Writing a resource fork can update mtime, so restore it after xattrs.
+        os.utime(quarantine_path, ns=(final_stat.st_atime_ns, final_stat.st_mtime_ns))
 
         fsync_file(quarantine_path)
         fsync_dir(quarantine_path.parent)
@@ -4069,6 +4765,8 @@ def commit_one_rename(args: argparse.Namespace, quiet: bool = False) -> dict[str
         if sha256_file(quarantine_path) != original_sha:
             raise RuntimeError("rename_quarantine_copy_hash_mismatch")
 
+        if security.digest(quarantine_path) != original_sha:
+            raise RuntimeError("source_changed_during_verification")
         fst = final_path.stat()
         con.execute(
             "UPDATE assets SET relpath=?,size=?,mtime_ns=?,birth_ts=?,quick_hash=?,full_hash=?,"
@@ -4179,6 +4877,7 @@ def commit_one_rename(args: argparse.Namespace, quiet: bool = False) -> dict[str
             print(f"Report: {report_path}")
             print(f"Commit ID: {commit_id}")
 
+        security.journal_done(state_dir, commit_id)
         return result
 
     except Exception as exc:
@@ -4186,17 +4885,19 @@ def commit_one_rename(args: argparse.Namespace, quiet: bool = False) -> dict[str
 
         try:
             # If canonical destination exists, put it back at the original path.
-            if final_path.exists():
+            if installed and final_path.exists():
                 if source.exists():
                     failed = state_dir / "failed-commit-output" / commit_id / final_relpath
-                    failed.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(final_path, failed)
+                    security.ensure_parent(failed, state_dir)
+                    security.move_no_replace(final_path, failed, root, state_dir)
+                    installed = False
                 else:
-                    os.replace(final_path, source)
+                    security.move_no_replace(final_path, source, root, root)
+                    installed = False
 
             # If only the quarantine copy exists, restore from that.
             if not source.exists() and quarantine_path.exists():
-                os.replace(quarantine_path, source)
+                security.move_no_replace(quarantine_path, source, state_dir, root)
 
             if source.exists() and sha256_file(source) == original_sha:
                 rollback_note += "; original_restored"
@@ -4230,6 +4931,8 @@ def commit_one_rename(args: argparse.Namespace, quiet: bool = False) -> dict[str
         raise SystemExit(f"Rename commit failed safely: {rollback_note}")
 
     finally:
+        if source.is_file() and not quarantine_path.exists() and not installed:
+            security.journal_done(state_dir, commit_id)
         try:
             con.close()
         except Exception:
@@ -4261,7 +4964,7 @@ def already_committed_relpaths(db_path: Path) -> set[str]:
         return set()
     con = sqlite3.connect(db_path)
     try:
-        rows = con.execute("SELECT DISTINCT relpath FROM commit_items WHERE status='COMMITTED'").fetchall()
+        rows = con.execute("SELECT DISTINCT relpath FROM commit_items WHERE status='COMMITTED' AND operation<>'SET_EMBEDDED_DATE'").fetchall()
         return {str(r[0]) for r in rows}
     finally:
         con.close()
@@ -4616,83 +5319,68 @@ def cmd_commit_video_batch(args: argparse.Namespace) -> int:
     print(f"Batch report: {report_path}")
     return 0 if counts.get("FAILED_SAFE", 0) == 0 else 1
 
+@security.state_operation
+@media_change_log.logged_action
 def cmd_rollback(args: argparse.Namespace) -> int:
     if not args.yes:
         raise SystemExit("Rollback requires --yes")
     state_dir = Path(args.state_dir).expanduser().resolve()
-    db_path = state_dir / "media-maintenance.sqlite"
-    if not db_path.exists(): raise SystemExit(f"State database not found: {db_path}")
-    con = sqlite3.connect(db_path); con.row_factory = sqlite3.Row
-    commit = con.execute("SELECT * FROM commits WHERE commit_id=?", (args.commit_id,)).fetchone()
-    if not commit or commit["status"] != "COMMITTED":
-        raise SystemExit("Commit ID is not in COMMITTED state")
-    items = list(con.execute("SELECT * FROM commit_items WHERE commit_id=? AND status='COMMITTED'", (args.commit_id,)))
-    if len(items) != 1:
-        raise SystemExit("v0.4.0 rollback supports exactly one committed item")
-    r = items[0]
-    current = Path(r["final_path"]); original = Path(r["quarantine_path"])
+    security.identifier(args.commit_id)
+    db_path = security.inside(state_dir, "media-maintenance.sqlite")
+    if not db_path.exists():
+        raise SystemExit("No state database found")
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
     try:
+        commit = con.execute("SELECT * FROM commits WHERE commit_id=?", (args.commit_id,)).fetchone()
+        if not commit or commit["status"] != "COMMITTED":
+            raise SystemExit("Commit ID is not in COMMITTED state")
+        items = list(con.execute("SELECT * FROM commit_items WHERE commit_id=? AND status='COMMITTED'", (args.commit_id,)))
+        if len(items) != 1:
+            raise SystemExit("Rollback requires exactly one committed item")
+        r = items[0]
         d = json.loads(r["details_json"] or "{}")
-    except Exception:
-        d = {}
-    asset_id = d.get("asset_id")
-    original_relpath = d.get("original_relpath") or r["relpath"]
-    final_relpath = d.get("final_relpath")
-    policy_version = d.get("policy_version")
-    # Image commits restore to the same pathname. Video commits may have changed
-    # only the extension (.m4v/.mov -> .mp4), so restore the original filename too.
-    restore_path = current if not final_relpath or final_relpath == original_relpath else current.with_name(Path(original_relpath).name)
-    if restore_path != current and restore_path.exists():
-        raise SystemExit(f"Refusing rollback: original pathname is occupied: {restore_path}")
-    if not current.is_file() or not original.is_file():
-        raise SystemExit("Rollback prerequisites missing: current file or quarantined original is unavailable")
-    current_sha = sha256_file(current)
-    if current_sha != r["final_sha256"]:
-        raise SystemExit("Refusing rollback: current Media file changed since commit")
-    if sha256_file(original) != r["source_original_sha256"]:
-        raise SystemExit("Refusing rollback: quarantined original hash does not match commit record")
-    rollback_id = sha256_text(canonical_json({"commit_id": args.commit_id, "started": now_iso()}))[:16]
-    displaced_dir = state_dir / "rollback-displaced" / rollback_id
-    displaced = displaced_dir / (final_relpath or r["relpath"])
-    displaced.parent.mkdir(parents=True, exist_ok=False)
-    con.execute("INSERT INTO rollbacks(rollback_id,commit_id,started_at,status,displaced_dir) VALUES(?,?,?,?,?)", (rollback_id,args.commit_id,now_iso(),"RUNNING",str(displaced_dir)))
-    con.commit()
-    try:
-        os.replace(current, displaced)
-        os.replace(original, restore_path)
-        fsync_dir(restore_path.parent)
-        if sha256_file(restore_path) != r["source_original_sha256"]:
-            raise RuntimeError("restored_original_hash_mismatch")
-        # If a video commit changed .mov/.m4v to .mp4, return durable asset identity
-        # to the original relpath and mark that processing-history event rolled back.
-        if asset_id and final_relpath and final_relpath != original_relpath:
-            con.execute("UPDATE assets SET relpath=?,active=1 WHERE asset_id=?", (original_relpath, int(asset_id)))
-        if asset_id and policy_version:
-            con.execute("UPDATE processing_history SET status='ROLLED_BACK' WHERE asset_id=? AND policy_version=? AND operation=? AND status='COMMITTED'",
-                        (int(asset_id), policy_version, r["operation"]))
-        report_path = state_dir / f"rollback-{rollback_id}.md"
-        report_path.write_text("\n".join(["# Veronica Rollback Report","",f"- Rollback ID: `{rollback_id}`",f"- Commit ID: `{args.commit_id}`",f"- Restored: `{restore_path}`",f"- Displaced committed output: `{displaced}`","","- Status: **ROLLED_BACK**",""]),encoding="utf-8")
-        con.execute("UPDATE rollbacks SET completed_at=?,status='ROLLED_BACK',report_path=? WHERE rollback_id=?",(now_iso(),str(report_path),rollback_id))
-        con.execute("UPDATE commit_items SET status='ROLLED_BACK' WHERE commit_id=? AND relpath=?",(args.commit_id,r["relpath"]))
-        con.execute("UPDATE commits SET status='ROLLED_BACK' WHERE commit_id=?",(args.commit_id,))
+        root = Path(con.execute("SELECT value FROM meta WHERE key='root'").fetchone()[0]).resolve()
+        old_rel = d.get("original_relpath") or r["relpath"]
+        final_rel = d.get("final_relpath") or old_rel
+        current = security.inside(root, final_rel)
+        restore = security.inside(root, old_rel)
+        original = security.inside(state_dir, f"quarantine/{args.commit_id}/{old_rel}")
+        if Path(r["final_path"]).resolve() != current or Path(r["quarantine_path"]).resolve() != original:
+            raise ValueError("Rollback paths do not match the library transaction")
+        if destination_is_occupied(current, restore):
+            raise SystemExit("Refusing rollback: original pathname is occupied")
+        if security.digest(current) != r["final_sha256"]:
+            raise SystemExit("Refusing rollback: current Media file changed since commit")
+        if security.digest(original) != r["source_original_sha256"]:
+            raise SystemExit("Refusing rollback: quarantined original hash does not match commit record")
+        media_change_log.begin_action(args, state_dir, 'restore', [root])
+        rid = sha256_text(canonical_json({"commit_id": args.commit_id, "started": now_iso()}))[:16]
+        displaced = security.inside(state_dir, f"rollback-displaced/{rid}/{final_rel}")
+        security.ensure_parent(displaced, state_dir)
+        con.execute("INSERT INTO rollbacks(rollback_id,commit_id,started_at,status,displaced_dir) VALUES(?,?,?,?,?)", (rid,args.commit_id,now_iso(),"RUNNING",str(state_dir / "rollback-displaced" / rid)))
         con.commit()
-        print(f"ROLLED_BACK: {r['relpath']}")
-        print(f"Displaced committed output: {displaced}")
-        print(f"Report: {report_path}")
+        security.journal_begin(state_dir, root, args.commit_id, restore, current, original,
+                               r["source_original_sha256"], r["final_sha256"], r["operation"], rollback_id=rid)
+        security.move_no_replace(current, displaced, root, state_dir)
+        security.move_no_replace(original, restore, state_dir, root)
+        if security.digest(restore) != r["source_original_sha256"]:
+            raise RuntimeError("Restored original hash mismatch; recovery is required")
+        if d.get("asset_id"):
+            con.execute("UPDATE assets SET relpath=?,active=1 WHERE asset_id=?", (old_rel, d["asset_id"]))
+            con.execute("UPDATE processing_history SET status='ROLLED_BACK' WHERE asset_id=? AND policy_version=? AND operation=? AND status='COMMITTED'", (d["asset_id"],d.get("policy_version"),r["operation"]))
+        report_path = state_dir / f"rollback-{rid}.md"
+        report_path.write_text(f"# Veronica Rollback Report\n\nStatus: ROLLED_BACK\n\nRestored: {old_rel}\n\nDisplaced output retained: {displaced}\n")
+        con.execute("UPDATE rollbacks SET completed_at=?,status='ROLLED_BACK',report_path=? WHERE rollback_id=?", (now_iso(),str(report_path),rid))
+        con.execute("UPDATE commit_items SET status='ROLLED_BACK' WHERE commit_id=?", (args.commit_id,))
+        con.execute("UPDATE commits SET status='ROLLED_BACK' WHERE commit_id=?", (args.commit_id,))
+        con.commit()
+        security.journal_done(state_dir, args.commit_id)
+        print(f"ROLLED_BACK: {old_rel}")
         return 0
-    except Exception as exc:
-        # Try to put committed output back if restoration did not complete safely.
-        if not current.exists() and displaced.exists():
-            os.replace(displaced, current)
-        # If the original was restored to a renamed path before a later failure,
-        # move it back to quarantine so the commit state is not half-rolled-back.
-        if restore_path != current and restore_path.exists() and not original.exists():
-            original.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(restore_path, original)
-        con.execute("UPDATE rollbacks SET completed_at=?,status='FAILED' WHERE rollback_id=?",(now_iso(),rollback_id)); con.commit()
-        raise SystemExit(f"Rollback failed: {exc}")
     finally:
         con.close()
+
 
 def cmd_doctor() -> int:
     print(f"Veronica {VERSION} dependency check")
@@ -4710,17 +5398,23 @@ def cmd_doctor() -> int:
     return 0
 
 
+@security.state_operation
 def cmd_plan(args: argparse.Namespace) -> int:
     root = Path(args.root).expanduser().resolve()
     if not root.is_dir():
         raise SystemExit(f"Root does not exist or is not a directory: {root}")
     cfg = load_config(Path(args.config).expanduser() if args.config else None)
     state_dir = Path(args.state_dir).expanduser().resolve()
+    validate_media_state_roots(root, state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     run_date = dt.date.fromisoformat(args.run_date) if args.run_date else dt.date.today()
     cfg = apply_product_settings(cfg, state_dir, run_date)
+    cfg["scan_root"] = str(root)
 
-    auditor = audit.Auditor(root, cfg, run_date, state_dir, full_hashing=False, probe_media=True)
+    replacement = getattr(args, "replacement_plan", None)
+    if replacement is not None:
+        cfg = json.loads(json.dumps(replacement["config_snapshot"]))
+    auditor = audit.Auditor(root, cfg, run_date, state_dir, full_hashing=True, probe_media=True)
     cutoff_override = getattr(args, "cutoff_override", None)
     if cutoff_override:
         auditor.cutoff = dt.date.fromisoformat(cutoff_override)
@@ -4741,13 +5435,21 @@ def cmd_plan(args: argparse.Namespace) -> int:
     elif scope_mode == "outside":
         print(f"Date scope: outside {scope.get('start')} through {scope.get('end')}")
     print("Mode: PLAN ONLY (media files will not be changed)")
-    auditor.walk()
+    progress = getattr(args, "progress_callback", None)
+    if progress is not None:
+        progress("discovering", 0, None)
+        auditor.walk(on_progress=lambda completed, total: progress("scanning", completed, total))
+        progress("planning", len(auditor.rows), None)
+    elif replacement is not None:
+        auditor.scan_file(security.inside(root, args.replace_relpath))
+    else:
+        auditor.walk()
 
     # Explicitly account for ignore-name exclusions; this reconciles the previous 44,235 tag scan
     # vs 43,846 audit count when .DS_Store is the only ignored name.
     ignored_counts = Counter()
     ignore_names = set(cfg.get("ignore_names", []))
-    for dirpath, _, filenames in os.walk(root, topdown=True, followlinks=False):
+    for dirpath, _, filenames in ([] if replacement is not None else os.walk(root, topdown=True, followlinks=False)):
         for name in filenames:
             if name in ignore_names:
                 ignored_counts[name] += 1
@@ -4755,20 +5457,21 @@ def cmd_plan(args: argparse.Namespace) -> int:
     run_id = sha256_text(canonical_json({"root": str(root), "run_date": run_date.isoformat(), "started": now_iso()}))[:24]
     db_path = state_dir / "media-maintenance.sqlite"
     con = init_db(db_path, root)
-    con.execute("UPDATE assets SET active=0")
+    if replacement is None:
+        con.execute("UPDATE assets SET active=0")
     con.execute("INSERT INTO runs(run_id,started_at,run_date,cutoff,root,tool_version,status) VALUES(?,?,?,?,?,?,?)",
                 (run_id, now_iso(), run_date.isoformat(), auditor.cutoff.isoformat(), str(root), VERSION, "SCANNING"))
 
-    items = []
+    current_recipe_digest = recipe_digest(state_dir)
+    items = [i for i in replacement["items"] if i["relpath"] != args.original_relpath] if replacement else []
     legacy_v1 = legacy_v2 = 0
     for row in auditor.rows:
         asset_id = upsert_asset(con, row, run_id, cfg)
         tags = set(row.get("tags", []))
         if "compressed-v1" in tags: legacy_v1 += 1
         if tags & set(cfg.get("legacy_v2_tags", [])): legacy_v2 += 1
-        # Date uncertainty should not block byte optimization when the user is
-        # maintaining all dates. It does, however, suppress automatic date-based
-        # filename standardization for that item.
+        # A usable embedded date is mandatory even for All dates. The older
+        # generic uncertainty override is disabled by the embedded-only policy.
         auto_date_review = should_auto_optimize_date_review(row, cfg)
 
         # PROCESS_NORMALLY is deliberately narrow. It may override only the
@@ -4853,7 +5556,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
         if item.get("operation") in {"CONVERT_IMAGE", "CONVERT_VIDEO", "CONVERT_AUDIO"} and item.get("executable"):
             kept = historical_keep_original(
                 con, asset_id, item.get("operation"), item.get("policy_version"),
-                row.get("quick_hash"), int(row.get("size") or 0)
+                row.get("quick_hash"), int(row.get("size") or 0), current_recipe_digest
             )
             if kept is not None:
                 item.update(
@@ -4922,8 +5625,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
         # policy upgrade does not invalidate an unchanged archival result.
         if item.get("executable") and item.get("policy_version"):
             done = con.execute(
-                "SELECT 1 FROM processing_history WHERE asset_id=? AND policy_version=? AND status='COMMITTED' LIMIT 1",
-                (asset_id, item.get("policy_version")),
+                "SELECT 1 FROM processing_history WHERE asset_id=? AND policy_version=? AND output_full_hash=? AND status='COMMITTED' LIMIT 1",
+                (asset_id, item.get("policy_version"), row.get("full_hash")),
             ).fetchone()
             if done:
                 item.update(operation="SKIP_CURRENT_POLICY", executable=False,
@@ -4953,9 +5656,11 @@ def cmd_plan(args: argparse.Namespace) -> int:
         "run_date": run_date.isoformat(),
         "cutoff": auditor.cutoff.isoformat(),
         "date_scope": dict(cfg.get("date_scope") or {}),
-        "files_inventoried": len(auditor.rows),
+        "files_inventoried": len(items),
         "ignored_files": dict(ignored_counts),
         "legacy": {"v1_assets": legacy_v1, "v2_assets": legacy_v2},
+        "recipe_digest": recipe_digest(state_dir),
+        "config_snapshot": cfg,
         "policy_snapshot": {
             "policies": dict(cfg.get("policies", {})),
             "video": {
@@ -5009,7 +5714,7 @@ def _uncommitted_staged_rows(con: sqlite3.Connection, operation: Optional[str] =
         WHERE si.status='STAGED_VERIFIED'
           AND NOT EXISTS (
               SELECT 1 FROM commit_items ci
-              WHERE ci.relpath=si.relpath AND ci.status='COMMITTED'
+              WHERE ci.relpath=si.relpath AND ci.status='COMMITTED' AND ci.operation<>'SET_EMBEDDED_DATE'
           )
     """
     params: tuple[Any, ...] = ()
@@ -5032,7 +5737,7 @@ def cmd_run_status(args: argparse.Namespace) -> int:
         raise SystemExit(f"No state database found: {db}")
     plan_path = Path(args.plan).expanduser().resolve() if args.plan else None
     if plan_path:
-        plan = load_plan(plan_path)
+        plan = load_plan(plan_path, Path(args.state_dir).expanduser().resolve())
         plan_id = plan["plan_id"]
     else:
         con = sqlite3.connect(db); con.row_factory = sqlite3.Row
@@ -5117,6 +5822,7 @@ def cmd_run_status(args: argparse.Namespace) -> int:
     return 0
 
 
+@security.state_operation
 def cmd_next_batch(args: argparse.Namespace) -> int:
     state_dir=Path(args.state_dir).expanduser().resolve()
     db=state_dir/"media-maintenance.sqlite"
@@ -5161,6 +5867,7 @@ def _staging_dir_size(path: Path) -> int:
     return total
 
 
+@security.state_operation
 def cmd_cleanup_superseded(args: argparse.Namespace) -> int:
     state_dir=Path(args.state_dir).expanduser().resolve()
     db=state_dir/"media-maintenance.sqlite"
@@ -5168,18 +5875,23 @@ def cmd_cleanup_superseded(args: argparse.Namespace) -> int:
     plan=load_plan(Path(args.plan).expanduser().resolve()) if args.plan else None
     plan_id=plan.get("plan_id") if plan else None
     con=sqlite3.connect(db); con.row_factory=sqlite3.Row
-    runs=list(con.execute("SELECT staging_id,plan_id,status,staging_dir FROM staging_runs ORDER BY started_at"))
-    committed=already_committed_relpaths(db)
-    candidates=[]; blocked=[]
-    for run in runs:
-        rows=list(con.execute("SELECT relpath,operation,status FROM staging_items WHERE staging_id=?",(run["staging_id"],)))
-        # Runs from an older frozen plan are superseded by definition when --plan is supplied.
-        superseded = bool(plan_id and run["plan_id"] != plan_id)
-        blockers=[] if superseded else [r for r in rows if r["status"]=='STAGED_VERIFIED' and r["operation"] in ('CONVERT_IMAGE','CONVERT_VIDEO','CONVERT_AUDIO') and r["relpath"] not in committed]
-        path=Path(run["staging_dir"])
-        rec={"id":run["staging_id"],"path":path,"size":_staging_dir_size(path),"blockers":len(blockers),"superseded":superseded}
-        (blocked if blockers else candidates).append(rec)
-    con.close()
+    try:
+        runs=list(con.execute("SELECT staging_id,plan_id,status,staging_dir FROM staging_runs ORDER BY started_at"))
+        committed=already_committed_relpaths(db)
+        candidates=[]; blocked=[]
+        for run in runs:
+            rows=list(con.execute("SELECT relpath,operation,status FROM staging_items WHERE staging_id=?",(run["staging_id"],)))
+            # Runs from an older frozen plan are superseded by definition when --plan is supplied.
+            superseded = bool(plan_id and run["plan_id"] != plan_id)
+            blockers=[] if superseded else [r for r in rows if r["status"]=='STAGED_VERIFIED' and r["operation"] in ('CONVERT_IMAGE','CONVERT_VIDEO','CONVERT_AUDIO') and r["relpath"] not in committed]
+            security.identifier(run["staging_id"])
+            path = security.inside(state_dir, f"staging/{run['staging_id']}")
+            if Path(run["staging_dir"]).resolve() != path:
+                raise ValueError("Cleanup record points outside its expected staging folder")
+            rec={"id":run["staging_id"],"path":path,"size":_staging_dir_size(path),"blockers":len(blockers),"superseded":superseded}
+            (blocked if blockers else candidates).append(rec)
+    finally:
+        con.close()
     print(f"Veronica {VERSION} superseded staging cleanup")
     print(f"Safe-to-remove staging directories: {len(candidates)}")
     print(f"Blocked staging directories: {len(blocked)}")
@@ -5190,10 +5902,11 @@ def cmd_cleanup_superseded(args: argparse.Namespace) -> int:
         print("DRY RUN: nothing deleted. Re-run with --apply to remove only SAFE staging directories; reports, SQLite, and quarantine remain.")
         return 0
     for r in candidates:
-        if r["path"].exists(): shutil.rmtree(r["path"])
+        if r["path"].exists(): security.remove_staging(state_dir, r["id"])
     print(f"Removed {len(candidates)} safe staging directories. Reports, SQLite state, and quarantine were preserved.")
     return 0
 
+@security.state_operation
 def cmd_cleanup(args: argparse.Namespace) -> int:
     state_dir = Path(args.state_dir).expanduser().resolve()
     if not args.staging_id:
@@ -5206,7 +5919,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         if r.get("status")=="STAGED_VERIFIED" and r.get("operation") in ("CONVERT_IMAGE","CONVERT_VIDEO","CONVERT_AUDIO") and r.get("verification",{}).get("metadata_ready_for_commit") is True:
             if r.get("relpath") not in committed:
                 blockers.append(r.get("relpath"))
-    stage_dir = state_dir / "staging" / args.staging_id
+    stage_dir = security.inside(state_dir, f"staging/{security.identifier(args.staging_id)}")
     size=0
     if stage_dir.exists():
         for p in stage_dir.rglob('*'):
@@ -5224,16 +5937,17 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     if not args.apply:
         print("DRY RUN: nothing deleted. Re-run with --apply to remove only this staging directory; reports and quarantine remain.")
         return 0
-    if stage_dir.exists(): shutil.rmtree(stage_dir)
+    if stage_dir.exists(): security.remove_staging(state_dir, args.staging_id)
     print("Removed staging directory. Reports, SQLite state, and quarantine were preserved.")
     return 0
 
 
+@security.state_operation
 def cmd_resolve_review(args: argparse.Namespace) -> int:
     if not args.yes:
         raise SystemExit("Refusing durable review resolution without --yes")
     plan_path = Path(args.plan).expanduser().resolve()
-    plan = load_plan(plan_path)
+    plan = load_plan(plan_path, Path(args.state_dir).expanduser().resolve())
     state_dir = Path(args.state_dir).expanduser().resolve()
     db_path = state_dir / "media-maintenance.sqlite"
     if not db_path.exists():
@@ -5307,6 +6021,7 @@ def cmd_resolve_review(args: argparse.Namespace) -> int:
         con.close()
 
 
+@security.state_operation
 def cmd_configure_filenames(args: argparse.Namespace) -> int:
     """Persist the user-visible filename policy without modifying media."""
     state_dir = Path(args.state_dir).expanduser().resolve()
@@ -5314,7 +6029,7 @@ def cmd_configure_filenames(args: argparse.Namespace) -> int:
     if args.enabled not in {"true", "false"}:
         raise SystemExit("--enabled must be true or false")
 
-    if args.date_format not in _SUPPORTED_FILENAME_DATE_FORMATS:
+    if not valid_filename_date_format(args.date_format):
         raise SystemExit(
             "Unsupported filename date format. "
             "This build supports: " + ", ".join(sorted(_SUPPORTED_FILENAME_DATE_FORMATS))
@@ -5329,6 +6044,7 @@ def cmd_configure_filenames(args: argparse.Namespace) -> int:
     current["filename_date_format"] = args.date_format
     current["filename_max_bytes"] = max_bytes
     current["filename_settings_updated_at"] = now_iso()
+    synchronize_legacy_recipe_update(current, {'filename_standardization_enabled', 'filename_max_bytes', 'filename_date_format'})
     save_product_settings(state_dir, current)
 
     print(json.dumps(
@@ -5340,6 +6056,7 @@ def cmd_configure_filenames(args: argparse.Namespace) -> int:
 
 
 
+@security.state_operation
 def cmd_configure_media_types(args: argparse.Namespace) -> int:
     """Persist which media types Veronica is permitted to modify."""
     state_dir = Path(args.state_dir).expanduser().resolve()
@@ -5389,6 +6106,7 @@ def cmd_configure_media_types(args: argparse.Namespace) -> int:
     )
     current["media_processing_settings_updated_at"] = now_iso()
 
+    synchronize_legacy_recipe_update(current, {'process_audio', 'process_images', 'process_videos', 'process_video_extensions', 'process_image_extensions', 'process_audio_extensions'})
     save_product_settings(state_dir, current)
 
     print(json.dumps(
@@ -5399,6 +6117,36 @@ def cmd_configure_media_types(args: argparse.Namespace) -> int:
     return 0
 
 
+def manual_workflow_defaults() -> dict[str, Any]:
+    return {
+        "image_output_format": "jpeg", "image_max_megapixels": 20.0, "jpeg_quality": 70,
+        "video_max_edge": 1280, "audio_min_size_mb": 10,
+        "recompress_images_below_target": True, "minimum_saving_percent": 10.0, "minimum_saving_mb": 1.0,
+        "video_allow_camera_metadata_drop": True,
+        "process_images": True, "process_videos": True, "process_audio": True,
+        "process_image_extensions": sorted(audit.IMAGE_EXTS - {".gif"}),
+        "process_video_extensions": sorted(audit.VIDEO_EXTS),
+        "process_audio_extensions": sorted(audit.AUDIO_EXTS),
+        "excluded_directory_names": list(audit.DEFAULT_EXCLUDED_DIRECTORY_NAMES),
+        "date_scope_mode": "older_than_two_years", "date_scope_start": None, "date_scope_end": None,
+        "filename_standardization_enabled": True, "filename_date_format": "YYMMDD-", "filename_max_bytes": 60,
+    }
+
+
+@security.state_operation
+def cmd_restore_manual_defaults(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).expanduser().resolve()
+    current = load_product_settings(state_dir)
+    current.update(manual_workflow_defaults())
+    current["optimization_settings_updated_at"] = now_iso()
+    current["media_processing_settings_updated_at"] = now_iso()
+    synchronize_legacy_recipe_update(current, RECIPE_SETTING_KEYS)
+    save_product_settings(state_dir, current)
+    print(json.dumps({"restored": True}))
+    return 0
+
+
+@security.state_operation
 def cmd_configure_optimization(args: argparse.Namespace) -> int:
     """Persist user-visible optimization recipe settings without modifying media."""
     state_dir = Path(args.state_dir).expanduser().resolve()
@@ -5406,12 +6154,15 @@ def cmd_configure_optimization(args: argparse.Namespace) -> int:
     current = load_product_settings(state_dir)
     current["image_output_format"] = args.image_format
     current["image_max_megapixels"] = float(args.image_max_megapixels)
+    if args.photo_library_max_megapixels is not None:
+        current["photo_library_max_megapixels"] = float(args.photo_library_max_megapixels)
     current["jpeg_quality"] = int(args.jpeg_quality)
     current["video_max_edge"] = int(args.video_max_edge)
     current["audio_min_size_mb"] = int(args.audio_min_size_mb)
     current["video_allow_camera_metadata_drop"] = args.allow_camera_metadata_drop == "true"
     current["optimization_settings_updated_at"] = now_iso()
 
+    synchronize_legacy_recipe_update(current, {'video_allow_camera_metadata_drop', 'image_output_format', 'audio_min_size_mb', 'image_max_megapixels', 'video_max_edge', 'jpeg_quality'})
     save_product_settings(state_dir, current)
 
     print(json.dumps(
@@ -5421,12 +6172,13 @@ def cmd_configure_optimization(args: argparse.Namespace) -> int:
     ))
     return 0
 
+@security.state_operation
 def cmd_configure_date_scope(args: argparse.Namespace) -> int:
     """Persist the date range used to decide which media is eligible."""
     state_dir = Path(args.state_dir).expanduser().resolve()
     mode = str(args.mode)
 
-    if mode not in {"all", "within", "outside"}:
+    if mode not in {"older_than_two_years", "legacy", "all", "within", "outside"}:
         raise SystemExit("--mode must be all, within, or outside")
 
     start = args.start
@@ -5453,6 +6205,7 @@ def cmd_configure_date_scope(args: argparse.Namespace) -> int:
     current["date_scope_start"] = start
     current["date_scope_end"] = end
     current["date_scope_updated_at"] = now_iso()
+    synchronize_legacy_recipe_update(current, {'date_scope_start', 'date_scope_end', 'date_scope_mode'})
     save_product_settings(state_dir, current)
 
     print(json.dumps(
@@ -5463,6 +6216,7 @@ def cmd_configure_date_scope(args: argparse.Namespace) -> int:
     return 0
 
 
+@security.state_operation
 def cmd_configure_folders(args: argparse.Namespace) -> int:
     """Add/remove folders Veronica should scan without repointing old state."""
     state_dir = Path(args.state_dir).expanduser().resolve()
@@ -5482,25 +6236,19 @@ def cmd_configure_folders(args: argparse.Namespace) -> int:
     remove = {normalized(value) for value in (args.remove or [])}
     folders = [folder for folder in folders if folder not in remove]
 
-    # Reject overlapping roots. Scanning both /Photos and /Photos/2024 would
-    # otherwise process the same file twice.
-    for index, left in enumerate(folders):
-        for right in folders[index + 1:]:
-            try:
-                right.relative_to(left)
-                raise SystemExit(
-                    f"Configured folders may not overlap: {left} contains {right}"
-                )
-            except ValueError:
+    # Keep recovery data outside every media root and prevent duplicate work
+    # through overlapping roots, symlinks, case aliases or macOS firmlinks.
+    for folder in folders:
+        validate_media_state_roots(folder, state_dir)
+    validate_folder_roots(folders)
+    for folder in folders:
+        prepare_scan_folder_state(state_dir, folder)
+    for folder in configured_scan_folders(state_dir):
+        if folder not in folders:
+            with security.state_access(scan_folder_state_dir(state_dir, folder), folder):
                 pass
-            try:
-                left.relative_to(right)
-                raise SystemExit(
-                    f"Configured folders may not overlap: {right} contains {left}"
-                )
-            except ValueError:
-                pass
-
+    # Initialization may have persisted preset metadata; preserve it.
+    current = load_product_settings(state_dir)
     current["scan_folders"] = [str(folder) for folder in folders]
     current["scan_folders_updated_at"] = now_iso()
 
@@ -5524,6 +6272,7 @@ def cmd_configure_folders(args: argparse.Namespace) -> int:
     return 0
 
 
+@security.state_operation
 def cmd_configure_library(args: argparse.Namespace) -> int:
     state_dir = Path(args.state_dir).expanduser().resolve()
     root = Path(args.root).expanduser().resolve()
@@ -5559,7 +6308,9 @@ def cmd_preflight(args: argparse.Namespace) -> int:
 
 
 def _ui_snapshot_for_folder(root: Path, state_dir: Path, recent_limit: int) -> dict[str, Any]:
-    """Read UI state for exactly one configured folder/state database."""
+    """Recover interrupted work, then read one configured folder database."""
+    if root.is_dir() and (state_dir / "media-maintenance.sqlite").exists():
+        security.recover_if_idle(state_dir)
     db = state_dir / "media-maintenance.sqlite"
 
     result = {
@@ -5569,8 +6320,11 @@ def _ui_snapshot_for_folder(root: Path, state_dir: Path, recent_limit: int) -> d
         "database_exists": db.exists(),
         "active_assets": 0,
         "committed_outputs": 0,
+        "optimized_outputs": 0,
+        "renamed_outputs": 0,
         "rolled_back_outputs": 0,
         "total_saving_bytes": 0,
+        "pending_staged_outputs": 0,
         "quarantine_directories": 0,
         "latest_plan": None,
         "unresolved_reviews": [],
@@ -5583,6 +6337,7 @@ def _ui_snapshot_for_folder(root: Path, state_dir: Path, recent_limit: int) -> d
     con = sqlite3.connect(db)
     con.row_factory = sqlite3.Row
     try:
+        result["pending_staged_outputs"] = len(_annual_live_pending(state_dir))
         result["active_assets"] = int(
             con.execute("SELECT COUNT(*) FROM assets WHERE active=1").fetchone()[0]
         )
@@ -5591,6 +6346,9 @@ def _ui_snapshot_for_folder(root: Path, state_dir: Path, recent_limit: int) -> d
                 "SELECT COUNT(*) FROM commit_items WHERE status='COMMITTED'"
             ).fetchone()[0]
         )
+        counts = dict(con.execute("SELECT operation,COUNT(*) FROM commit_items WHERE status='COMMITTED' GROUP BY operation"))
+        result["optimized_outputs"] = sum(counts.get(operation, 0) for operation in ("CONVERT_IMAGE", "CONVERT_VIDEO", "CONVERT_AUDIO"))
+        result["renamed_outputs"] = counts.get("RENAME", 0)
         result["rolled_back_outputs"] = int(
             con.execute(
                 "SELECT COUNT(*) FROM commit_items WHERE status='ROLLED_BACK'"
@@ -5679,6 +6437,10 @@ def _ui_snapshot_for_folder(root: Path, state_dir: Path, recent_limit: int) -> d
                 "plan_path": plan_path,
             }
 
+        if result["latest_plan"] and result["latest_plan"]["remaining_executable_count"] is None:
+            result["latest_plan"] = None
+            result["unresolved_reviews"] = []
+
         recent = con.execute(
             "SELECT ci.commit_id,ci.relpath,ci.operation,ci.final_path,"
             "c.completed_at,"
@@ -5722,8 +6484,250 @@ def _ui_snapshot_for_folder(root: Path, state_dir: Path, recent_limit: int) -> d
     return result
 
 
+def describe_scan_change(item: dict[str, Any], config: dict[str, Any]) -> str:
+    """Describe the frozen plan, never promise an unmeasured saving."""
+    operation = item["operation"]
+    target = item.get("target") or {}
+    if operation == "CONVERT_IMAGE":
+        fmt = str(target.get("format", "jpeg")).upper()
+        detail = f"Convert to {fmt}"
+        if fmt == "JPEG":
+            detail += f" at quality {int(config.get('jpeg_quality', 70))}"
+        detail += f"; resize only if above {float(target.get('max_megapixels', 20)):g} MP."
+        if target.get("preserve_alpha"):
+            detail += " Preserve transparency."
+    elif operation == "CONVERT_VIDEO":
+        detail = f"Convert to MP4 with the folder’s video preset; limit the longest edge to {int(config.get('video_max_storage_edge', 1280))} px without upscaling."
+        if config.get("video_allow_camera_metadata_drop"):
+            detail += " Camera metadata tracks may be removed."
+    elif operation == "CONVERT_AUDIO":
+        detail = f"Convert to MP3 at {int(target.get('bitrate_kbps', 128))} kbps."
+    elif operation == "RENAME":
+        detail = "Standardize the filename using this folder’s naming settings."
+    elif operation == "REVIEW":
+        return "Leave unchanged until you review this file. Veronica needs your decision before applying its normal optimization rules."
+    else:
+        reason = str(item.get("reason", ""))
+        if operation in {"SKIP_MEDIA_TYPE_DISABLED", "SKIP_EXTENSION_DISABLED"}:
+            explanation = "This file type is turned off in this folder’s settings."
+        elif operation == "SKIP_TOO_NEW":
+            explanation = "This file falls outside the folder’s selected date range."
+        elif operation == "SKIP_NONMEDIA" or "nonmedia" in reason:
+            explanation = "This file does not need photo, video or audio optimization."
+        elif "sqlite_current_policy" in reason:
+            explanation = "This file has already been optimized with the current rules."
+        elif operation == "SKIP_LEGACY_V2":
+            explanation = "This file already has a record of earlier optimization."
+        elif "audio_below_size_threshold" in reason:
+            explanation = "This audio file is below the folder’s size threshold."
+        elif operation == "SKIP_NO_BENEFIT":
+            explanation = "This file already meets the folder’s optimization targets."
+        elif reason == "excluded_directory":
+            explanation = "This file is in a subfolder you chose to skip in this folder’s settings."
+        elif operation == "PRESERVE":
+            explanation = "Veronica preserves this original to protect its content or format."
+        else:
+            explanation = "No safe optimization is planned for this file."
+        return "Leave unchanged. " + explanation
+    destination = target.get("final_relpath")
+    if destination and destination != item["relpath"]:
+        detail += f" Save as {destination}."
+    if operation.startswith("CONVERT_"):
+        detail += " Install only if the output passes verification and saves enough space."
+    return detail
+
+
+@security.state_operation
+@media_change_log.logged_action
+def cmd_set_file_date(args: argparse.Namespace) -> int:
+    """Edit one inspected file, preserving original bytes and re-planning only it."""
+    import contextlib
+    import io
+    import media_dates
+    import uuid
+    if not args.yes:
+        raise ValueError("Saving a file date requires --yes.")
+    state = Path(args.state_dir).expanduser().resolve()
+    plan = load_plan(Path(args.plan), state)
+    root = Path(plan["root"])
+    db = state / "media-maintenance.sqlite"
+    with security.database(db) as con:
+        latest = con.execute("SELECT plan_id FROM plans ORDER BY created_at DESC LIMIT 1").fetchone()
+    if not latest or latest[0] != plan["plan_id"]:
+        raise ValueError("The scan changed. Open this file again before saving its date.")
+    item = find_plan_item(plan, args.relpath)
+    if not item or item["operation"] == "PRESERVE":
+        raise ValueError("This file cannot safely be edited. Scan folders again.")
+    source = security.inside(root, item["relpath"])
+    valid, reason = verify_source_against_item(root, item)
+    expected = item.get("source_full_hash")
+    if not valid:
+        # A completed conversion may have changed the path and source bytes.
+        with security.database(db) as con:
+            row = con.execute("SELECT ci.final_path,ci.final_sha256 FROM commit_items ci JOIN commits c USING(commit_id) "
+                              "WHERE ci.relpath=? AND ci.status='COMMITTED' ORDER BY c.completed_at DESC LIMIT 1", (args.relpath,)).fetchone()
+        if not row:
+            raise ValueError("This file changed since scanning. Scan folders again before editing its date.")
+        source = security.inside(root, Path(row[0]).relative_to(root))
+        expected = row[1]
+        if security.digest(source) != expected:
+            raise ValueError("This file changed since cleanup. Scan folders again before editing its date.")
+    if source.suffix.lower() not in media_dates.SUPPORTED:
+        raise ValueError("Date editing is not available for this file format.")
+    if not source.stat().st_mode & 0o222:
+        raise ValueError("This file is read-only. Give it write permission before editing its date.")
+    if root.stat().st_dev != state.stat().st_dev:
+        raise ValueError("Date editing requires the folder and Veronica’s temporary files on the same disk.")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.date):
+        raise ValueError("Enter the date as YYYY-MM-DD.")
+    dt.date.fromisoformat(args.date)
+    media_change_log.begin_action(args, state, 'manual-date', [root])
+    cid = uuid.uuid4().hex[:16]
+    staged = security.inside(state, f"date-edits/{cid}/{source.name}")
+    security.ensure_parent(staged, state, exclusive=True)
+    security.copy_new(source, staged, root, state)
+    previous_date = media_dates.embedded(source)
+    before_bytes = source.stat().st_size
+    try:
+        media_dates.write_date(source, staged, args.date)
+        final_sha = security.digest(staged)
+        # No-op dates need no replacement and never send another original to Trash.
+        if final_sha == expected:
+            print(json.dumps({"saved": True, "date": args.date, "unchanged": True}))
+            return 0
+        if security.digest(source) != expected:
+            raise ValueError("This file changed while its date was being prepared. The edit was not installed.")
+        rel = str(source.relative_to(root))
+        backup = security.inside(state, f"quarantine/{cid}/{rel}")
+        security.ensure_parent(backup, state, exclusive=True)
+        temp = source.with_name(f".{source.name}.media-maintenance-{cid}.tmp")
+        with security.database(db) as con:
+            con.execute("INSERT INTO commits(commit_id,staging_id,plan_id,started_at,status,quarantine_dir) VALUES(?,?,?,?,?,?)",
+                        (cid, 'date-'+cid, plan["plan_id"], now_iso(), 'RUNNING', str(state/'quarantine'/cid)))
+        security.journal_begin(state, root, cid, source, source, backup, expected, final_sha, 'SET_EMBEDDED_DATE')
+        try:
+            security.move_no_replace(source, backup, root, state)
+            if security.digest(backup) != expected:
+                raise RuntimeError("The file changed before installation.")
+            security.copy_new(staged, temp, state, root)
+            media_dates.copy_attributes(backup, temp)
+            restored = restore_stage_filesystem_metadata(backup, temp)
+            if sys.platform == 'darwin' and not restored['creation_time_set']:
+                raise RuntimeError("The original file dates could not be preserved.")
+            fsync_file(temp)
+            security.move_no_replace(temp, source, root, root)
+            if security.digest(source) != final_sha:
+                raise RuntimeError("The installed file did not match the verified edit.")
+            # Reuse the complete planner with one freshly audited file. All other
+            # frozen decisions and source identities remain subject to their guards.
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_plan.__wrapped__(argparse.Namespace(root=str(root), state_dir=str(state), config=None,
+                    run_date=plan['run_date'], replacement_plan=plan, replace_relpath=rel,
+                    original_relpath=args.relpath))
+            if security.digest(source) != final_sha:
+                raise RuntimeError("The file changed while its new result was being prepared.")
+            with security.database(db) as con:
+                con.execute("INSERT INTO commit_items(commit_id,relpath,operation,status,source_original_sha256,staged_sha256,final_sha256,quarantine_path,final_path,details_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (cid, rel, 'SET_EMBEDDED_DATE', 'COMMITTED', expected, final_sha, final_sha, str(backup), str(source), canonical_json({'date':args.date,'previous_date':previous_date,'before_bytes':before_bytes,'after_bytes':source.stat().st_size})))
+                con.execute("UPDATE commits SET completed_at=?,status='COMMITTED' WHERE commit_id=?", (now_iso(),cid))
+            security.journal_done(state, cid)
+        except BaseException:
+            # The same durable recovery used for cleanup restores the original
+            # after any failed installation, including a killed application.
+            security.recover_transactions(state)
+            raise
+        print(json.dumps({"saved": True, "date": args.date, "relpath": rel}))
+        return 0
+    finally:
+        if staged.exists():
+            staged.unlink()
+
+
+def cmd_scan_results(args: argparse.Namespace) -> int:
+    """Page through all verified scan decisions without touching media."""
+    if not 1 <= args.limit <= 200 or args.offset < 0:
+        raise ValueError("Result pages must contain 1–200 files and use a nonnegative offset")
+    state_dir = Path(args.state_dir).expanduser().resolve()
+    folders = configured_scan_folders(state_dir)
+    validate_folder_roots(folders)
+    records = []
+    plan_ids = []
+    counts = {"all": 0, "changes": 0, "review": 0, "unchanged": 0}
+    query = args.search.casefold()
+    total = 0
+    items = []
+    for folder in folders:
+        settings = folder_settings_payload(state_dir, folder)
+        if settings["needs_analysis"]:
+            raise ValueError("Folder settings changed. Scan folders again before reviewing results.")
+        folder_state = scan_folder_state_dir(state_dir, folder)
+        db = folder_state / "media-maintenance.sqlite"
+        if not db.is_file():
+            raise ValueError("Scan all folders before reviewing results.")
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as con:
+            con.row_factory = sqlite3.Row
+            latest = con.execute("SELECT plan_id FROM plans ORDER BY created_at DESC LIMIT 1").fetchone()
+            if latest is None:
+                raise ValueError("Scan all folders before reviewing results.")
+            resolutions = {(int(row["asset_id"]), row["review_reason"], row["source_quick_hash"], int(row["source_size"]))
+                           for row in con.execute("SELECT * FROM review_resolutions WHERE resolution IN ('KEEP_AS_IS','PROCESS_NORMALLY')")}
+            unreadable = unreadable_source_relpaths(con, latest['plan_id'])
+            dates = {r["relpath"]: r["best_date"] for r in con.execute("SELECT relpath,best_date FROM assets WHERE active=1")}
+        candidates = sorted(folder_state.glob(f"plan-*-{latest['plan_id'][:12]}.json"))
+        if not candidates:
+            raise ValueError("Scan results are unavailable. Scan folders again.")
+        plan = load_plan(candidates[-1], folder_state)
+        plan_ids.append(plan["plan_id"])
+        remaining = {item["relpath"] for item in _annual_remaining(plan, folder_state)}
+        records.append((folder, folder_state, plan, remaining, resolutions, unreadable, dates, candidates[-1]))
+
+    scan_id = (plan_ids[0] if len(plan_ids) == 1 else
+               "multi-" + sha256_text(canonical_json(sorted(plan_ids)))[:24]) if plan_ids else "empty"
+    if args.scan_id and args.scan_id != scan_id:
+        raise ValueError("The scan changed. Return to the summary and open Review results again.")
+
+    for folder, folder_state, plan, remaining, resolutions, unreadable, dates, plan_path in records:
+        for item in plan["items"]:
+            executable = item["relpath"] in remaining
+            resolved = (int(item["asset_id"]), item["reason"], item.get("source_quick_hash"), int(item["source_size"])) in resolutions
+            category = "changes" if executable else "review" if item["operation"] == "REVIEW" and not resolved else "unchanged"
+            counts["all"] += 1
+            counts[category] += 1
+            if args.category != "all" and category != args.category:
+                continue
+            if query and query not in (str(folder) + "/" + item["relpath"]).casefold():
+                continue
+            if args.offset <= total < args.offset + args.limit or args.focus_relpath:
+                detail = describe_scan_change(item, plan.get("config_snapshot") or {})
+                if item["relpath"] in unreadable:
+                    detail = "Leave unchanged. Veronica couldn’t read this image safely; the original has not been replaced."
+                elif category == "unchanged" and item["operation"] == "REVIEW" and resolved:
+                    detail = "Your review decision has been recorded. Scan again to update this file’s plan."
+                elif category == "unchanged" and item.get("executable"):
+                    detail = "This planned action has already been completed or the original was kept. No further change is queued."
+                import media_dates
+                date_supported = Path(item["relpath"]).suffix.lower() in media_dates.SUPPORTED and item["operation"] != "PRESERVE"
+                items.append({"root": str(folder), "state_dir": str(folder_state),
+                              "plan_path": str(plan_path), "embedded_date": dates.get(item["relpath"]) or dates.get((item.get("target") or {}).get("final_relpath")),
+                              "can_edit_date": date_supported,
+                              "relpath": item["relpath"], "operation": item["operation"],
+                              "source_size": int(item["source_size"]), "reason": item["reason"],
+                              "category": category, "detail": detail,
+                              "destination": (item.get("target") or {}).get("final_relpath")})
+            total += 1
+    if args.focus_relpath:
+        index = next((i for i, record in enumerate(items)
+                      if record["relpath"] == args.focus_relpath and record["root"] == args.focus_root), 0)
+        args.offset = index // args.limit * args.limit
+        items = items[args.offset:args.offset + args.limit]
+    print(json.dumps({"scan_id": scan_id, "items": items, "total": total,
+                      "offset": args.offset, "limit": args.limit, "counts": counts}, ensure_ascii=False))
+    return 0
+
+
 def cmd_ui_snapshot(args: argparse.Namespace) -> int:
-    """Return an aggregated read-only snapshot for every configured folder."""
+    """Reconcile interrupted work and return every configured folder snapshot."""
+    security.recover_if_idle(Path(args.state_dir).expanduser().resolve())
     state_dir = Path(args.state_dir).expanduser().resolve()
     db = state_dir / "media-maintenance.sqlite"
 
@@ -5732,8 +6736,16 @@ def cmd_ui_snapshot(args: argparse.Namespace) -> int:
         folder for folder in scan_folders if not folder.is_dir()
     ]
 
+    validate_folder_roots(scan_folders)
+    for folder in scan_folders:
+        try:
+            prepare_scan_folder_state(state_dir, folder)
+        except RuntimeError as exc:
+            if "Another Veronica task" not in str(exc):
+                raise
+
     today = dt.date.today()
-    cutoff = _annual_calendar_cutoff(today)
+    cutoff = audit.calendar_years_before(today, 2) if date_scope_product_settings(state_dir, today)["mode"] == "older_than_two_years" else _annual_calendar_cutoff(today)
 
     folder_states = [
         _ui_snapshot_for_folder(
@@ -5830,6 +6842,8 @@ def cmd_ui_snapshot(args: argparse.Namespace) -> int:
             break
 
         folder_state_dir = scan_folder_state_dir(state_dir, folder)
+        if folder_settings_payload(state_dir, folder)["needs_analysis"]:
+            continue
         folder_db = folder_state_dir / "media-maintenance.sqlite"
         if not folder_db.is_file():
             continue
@@ -5910,8 +6924,11 @@ def cmd_ui_snapshot(args: argparse.Namespace) -> int:
         ],
         "active_assets": active_assets,
         "committed_outputs": committed_outputs,
+        "optimized_outputs": sum(x["optimized_outputs"] for x in folder_states),
+        "renamed_outputs": sum(x["renamed_outputs"] for x in folder_states),
         "rolled_back_outputs": rolled_back_outputs,
         "total_saving_bytes": total_saving_bytes,
+        "pending_staged_outputs": sum(x["pending_staged_outputs"] for x in folder_states),
         "quarantine_directories": quarantine_directories,
         "annual": {
             "run_year": today.year,
@@ -5925,6 +6942,9 @@ def cmd_ui_snapshot(args: argparse.Namespace) -> int:
         "media_processing": media_processing_product_settings(state_dir),
         "optimization_settings": optimization_product_settings(state_dir),
         "date_scope": date_scope_product_settings(state_dir, today),
+        "folder_settings": [folder_settings_payload(state_dir, folder) for folder in scan_folders],
+        "settings_presets": settings_presets(state_dir)[0],
+        "default_preset_id": settings_presets(state_dir)[1],
         "preflight": dependency_status(),
     }
 
@@ -5964,7 +6984,7 @@ def _annual_remaining(plan: dict[str, Any], state_dir: Path) -> list[dict[str, A
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     try:
-        kept = resolved_keep_original_relpaths(con, plan["plan_id"])
+        kept = resolved_keep_original_relpaths(con, plan["plan_id"]) | unreadable_source_relpaths(con, plan["plan_id"])
     finally:
         con.close()
     terminal = committed | kept
@@ -5998,6 +7018,25 @@ def _latest_staging_id_for_plan(state_dir: Path, plan_id: str) -> Optional[str]:
 
 def _annual_write_report(state_dir: Path, plan: dict[str, Any], status: str, started_at: str,
                          batch_records: list[dict[str, Any]], note: Optional[str] = None) -> Path:
+    # A batch can commit some items and then fail. Derive its completed work
+    # from durable transactions instead of counters updated only on success.
+    batch_records = [dict(record) for record in batch_records]
+    with sqlite3.connect(state_dir / "media-maintenance.sqlite") as con:
+        for record in batch_records:
+            committed = con.execute(
+                "SELECT ci.operation, COUNT(*), COALESCE(SUM(si.saving_bytes), 0) "
+                "FROM commit_items ci JOIN commits c ON c.commit_id=ci.commit_id "
+                "LEFT JOIN staging_items si "
+                "ON si.staging_id=c.staging_id AND si.relpath=ci.relpath "
+                "WHERE c.plan_id=? AND c.staging_id=? AND ci.status='COMMITTED' "
+                "GROUP BY ci.operation",
+                (plan["plan_id"], record["staging_id"]),
+            ).fetchall()
+            counts = {operation: count for operation, count, _ in committed}
+            for key, operation in (("renames", "RENAME"), ("images", "CONVERT_IMAGE"),
+                                   ("videos", "CONVERT_VIDEO"), ("audio", "CONVERT_AUDIO")):
+                record[f"committed_{key}"] = counts.get(operation, 0)
+            record["committed_saving_bytes"] = sum(saved for _, _, saved in committed)
     finished_at = now_iso()
     ops = Counter(i.get("operation") for i in plan.get("items", []))
     report = state_dir / f"annual-{plan['run_date']}-{plan['plan_id'][:12]}.md"
@@ -6021,10 +7060,11 @@ def _annual_write_report(state_dir: Path, plan: dict[str, Any], status: str, sta
     if batch_records:
         total_saved = sum(int(rec.get("committed_saving_bytes", 0) or 0) for rec in batch_records)
         lines.append(f"- Committed savings in this annual run: **{total_saved/1024**3:.2f} GiB**")
+        lines.append(f"- Committed savings in bytes: **{total_saved:,}**")
         for rec in batch_records:
             lines.append(
                 f"- staging `{rec['staging_id']}`: staged_verified={rec.get('verified',0)}, "
-                f"keep_original={rec.get('kept',0)}, committed_renames={rec.get('committed_renames',0)}, "
+                f"keep_original={rec.get('kept',0)}, unreadable_unchanged={rec.get('unreadable',0)}, committed_renames={rec.get('committed_renames',0)}, "
                 f"committed_images={rec.get('committed_images',0)}, "
                 f"committed_videos={rec.get('committed_videos',0)}, "
                 f"committed_audio={rec.get('committed_audio',0)}, "
@@ -6052,6 +7092,7 @@ def _annual_calendar_cutoff(run_date: dt.date) -> dt.date:
 
 
 
+@security.state_operation
 def cmd_analyze_all(args: argparse.Namespace) -> int:
     """Create plans for configured folders without staging or committing media."""
     base_state_dir = Path(args.state_dir).expanduser().resolve()
@@ -6061,6 +7102,9 @@ def cmd_analyze_all(args: argparse.Namespace) -> int:
         print("No scan folders are configured.", file=sys.stderr)
         return 2
 
+    validate_folder_roots(folders)
+    for folder in folders:
+        validate_media_state_roots(folder, base_state_dir)
     unavailable = [folder for folder in folders if not folder.is_dir()]
     if unavailable:
         print("Cannot analyze unavailable folders:", file=sys.stderr)
@@ -6070,24 +7114,46 @@ def cmd_analyze_all(args: argparse.Namespace) -> int:
 
     print(f"Analyzing {len(folders)} folder(s). Original media will not be changed.", flush=True)
 
-    for index, folder in enumerate(folders, 1):
-        print(f"ANALYZE_FOLDER {index}/{len(folders)} {folder}", flush=True)
-        folder_state = prepare_scan_folder_state(base_state_dir, folder)
-        plan_args = argparse.Namespace(
-            root=str(folder),
-            state_dir=str(folder_state),
-            config=args.config,
-            run_date=args.run_date,
-            cutoff_override=None,
-        )
-        result = cmd_plan(plan_args)
-        if result != 0:
-            return result
+    configure_event_stream(getattr(args, "events_jsonl", None))
+    try:
+        for index, folder in enumerate(folders, 1):
+            print(f"ANALYZE_FOLDER {index}/{len(folders)} {folder}", flush=True)
+            last_phase = None
+            last_update = 0.0
 
-    print("ANALYSIS_COMPLETE", flush=True)
-    return 0
+            def report_progress(phase: str, completed: int, total: Optional[int]) -> None:
+                nonlocal last_phase, last_update
+                now = time.monotonic()
+                if phase == last_phase and completed != total and now - last_update < 0.1:
+                    return
+                emit_event(
+                    "analysis_progress", phase=phase, folder=str(folder),
+                    folder_index=index, folder_count=len(folders),
+                    completed_files=completed, total_files=total,
+                )
+                last_phase, last_update = phase, now
+
+            folder_state = prepare_scan_folder_state(base_state_dir, folder)
+            plan_args = argparse.Namespace(
+                root=str(folder),
+                state_dir=str(folder_state),
+                config=args.config,
+                run_date=args.run_date,
+                cutoff_override=None,
+                progress_callback=report_progress if _EVENT_STREAM is not None else None,
+            )
+            result = cmd_plan(plan_args)
+            if result != 0:
+                return result
+
+        print("ANALYSIS_COMPLETE", flush=True)
+        return 0
+    finally:
+        close_event_stream()
 
 
+@security.state_operation
+@media_change_log.logged_action
 def cmd_annual_all(args: argparse.Namespace) -> int:
     """Run the proven single-folder annual controller for every configured folder."""
     if not args.yes:
@@ -6104,6 +7170,9 @@ def cmd_annual_all(args: argparse.Namespace) -> int:
             "No folders are configured. Add at least one folder in Veronica Settings first."
         )
 
+    validate_folder_roots(folders)
+    for folder in folders:
+        validate_media_state_roots(folder, base_state_dir)
     unavailable = [folder for folder in folders if not folder.is_dir()]
     if unavailable:
         print("Refusing annual run because configured folder(s) are unavailable:")
@@ -6111,6 +7180,7 @@ def cmd_annual_all(args: argparse.Namespace) -> int:
             print(f"  {folder}")
         return 2
 
+    group = media_change_log.begin_action(args, base_state_dir, 'cleanup', folders)
     print(f"Veronica {VERSION} multi-folder annual maintenance")
     print(f"Configured folders: {len(folders)}")
     print("Each folder uses an independent state database.")
@@ -6137,6 +7207,7 @@ def cmd_annual_all(args: argparse.Namespace) -> int:
             audio_batch=args.audio_batch,
             yes=True,
             events_jsonl=args.events_jsonl,
+            _change_log_group=group,
         )
 
         rc = cmd_annual(child_args)
@@ -6156,6 +7227,8 @@ def cmd_annual_all(args: argparse.Namespace) -> int:
     return 0
 
 
+@security.state_operation
+@media_change_log.logged_action
 def cmd_annual(args: argparse.Namespace) -> int:
     """One-command yearly controller built only from the existing proven primitives."""
     if not args.yes:
@@ -6171,6 +7244,7 @@ def cmd_annual(args: argparse.Namespace) -> int:
 
     state_dir = Path(args.state_dir).expanduser().resolve()
     root = require_archive_root(state_dir, args.root)
+    validate_media_state_roots(root, state_dir)
     if not state_dir.exists() and state_dir == default_state_dir() and legacy_state_dir().exists():
         raise SystemExit(
             f"Legacy Veronica state exists at {legacy_state_dir()}. "
@@ -6190,10 +7264,10 @@ def cmd_annual(args: argparse.Namespace) -> int:
         print("Commit, inspect, or clean those outputs before starting a new annual plan.")
         return 2
 
+    media_change_log.begin_action(args, state_dir, 'cleanup', [root], getattr(args, '_change_log_group', None))
     annual_run_date = dt.date.fromisoformat(args.run_date) if args.run_date else dt.date.today()
-    annual_cutoff = _annual_calendar_cutoff(annual_run_date)
-
     scope = date_scope_product_settings(state_dir, annual_run_date)
+    annual_cutoff = audit.calendar_years_before(annual_run_date, 2) if scope["mode"] == "older_than_two_years" else _annual_calendar_cutoff(annual_run_date)
 
     print(f"Veronica {VERSION} maintenance")
     print("Mode: ONE-COMMAND CONTROLLER WITH BOUNDED STAGING/COMMIT WINDOWS")
@@ -6239,7 +7313,7 @@ def cmd_annual(args: argparse.Namespace) -> int:
         raise SystemExit("Annual controller could not locate the immutable plan it just created")
     plan_id = str(row[0])
     plan_path = state_dir / f"plan-{run_date}-{plan_id[:12]}.json"
-    plan = load_plan(plan_path)
+    plan = load_plan(plan_path, Path(args.state_dir).expanduser().resolve())
     emit_event("plan_complete", plan_id=plan["plan_id"], plan_path=str(plan_path), inventoried=plan.get("files_inventoried", 0), executable=sum(1 for i in plan.get("items", []) if i.get("executable")), review=sum(1 for i in plan.get("items", []) if i.get("operation") == "REVIEW"))
 
     reviews = [i for i in plan.get("items", []) if i.get("operation") == "REVIEW"]
@@ -6400,12 +7474,13 @@ def cmd_annual(args: argparse.Namespace) -> int:
             raise SystemExit("Annual controller could not locate the staging run it just created")
         staging = load_staging_report(state_dir, staging_id)
         results = [r for r in staging.get("results", []) if r.get("operation") in {"CONVERT_IMAGE", "CONVERT_VIDEO", "CONVERT_AUDIO"}]
-        anomalous = [r for r in results if r.get("status") not in {"STAGED_VERIFIED", "KEEP_ORIGINAL"}]
+        anomalous = [r for r in results if r.get("status") not in {"STAGED_VERIFIED", "KEEP_ORIGINAL", "SOURCE_UNREADABLE"}]
         blocked = [r for r in results if r.get("status") == "STAGED_VERIFIED" and r.get("verification", {}).get("metadata_ready_for_commit") is not True]
         rec = {
             "staging_id": staging_id,
             "verified": sum(1 for r in results if r.get("status") == "STAGED_VERIFIED"),
             "kept": sum(1 for r in results if r.get("status") == "KEEP_ORIGINAL"),
+            "unreadable": sum(1 for r in results if r.get("status") == "SOURCE_UNREADABLE"),
             "committed_images": 0, "committed_videos": 0, "committed_audio": 0, "committed_saving_bytes": 0,
         }
         batches.append(rec)
@@ -6486,7 +7561,7 @@ def cmd_annual(args: argparse.Namespace) -> int:
     ]
 
     final_status = (
-        "COMPLETE_WITH_REVIEW"
+        "COMPLETE_WITH_SKIPPED_FILES" if any(rec.get("unreadable", 0) for rec in batches) else "COMPLETE_WITH_REVIEW"
         if unresolved_reviews
         else "COMPLETE"
     )
@@ -6497,6 +7572,9 @@ def cmd_annual(args: argparse.Namespace) -> int:
         if unresolved_reviews
         else "All safe executable work completed and no review items remain."
     )
+    unreadable_count = sum(rec.get("unreadable", 0) for rec in batches)
+    if unreadable_count:
+        final_note += f" {unreadable_count} unreadable source file(s) were left unchanged."
 
     report = _annual_write_report(
         state_dir,
@@ -6531,10 +7609,174 @@ def cmd_annual(args: argparse.Namespace) -> int:
     close_event_stream()
     return 0
 
+def prepare_desktop_session(preferences: Path, session: Path) -> None:
+    """Copy preferences, never old scan records, into a launch's working area.
+
+    SQLite remains a transaction scratchpad while work is in progress. The
+    desktop never consults a previous launch's file catalogue or decisions.
+    """
+    preferences = preferences.expanduser().resolve()
+    session = desktop_session_path(preferences, session)
+    folders = configured_scan_folders(preferences)
+    validate_folder_roots(folders)
+    for folder in folders:
+        validate_media_state_roots(folder, preferences)
+    with security.operation_lock(preferences):
+        saved = load_product_settings(preferences).copy()
+        saved["scan_folders"] = [str(folder) for folder in folders]
+        saved["desktop_session"] = True
+        with security.operation_lock(session):
+            save_product_settings(session, saved)
+            for folder in folders:
+                source = prepare_scan_folder_state(preferences, folder)
+                target = scan_folder_state_dir(session, folder)
+                with security.state_access(target, folder):
+                    child = load_product_settings(source).copy()
+                    child.update(archive_root=str(folder), scan_folders=[str(folder)],
+                                 parent_state_dir=str(session), managed_by_multi_folder=True)
+                    save_product_settings(target, child)
+
+
+def desktop_session_path(preferences: Path, session: Path) -> Path:
+    preferences = preferences.expanduser().resolve()
+    session = Path(os.path.abspath(session.expanduser()))
+    if session.parent != preferences / "Sessions.noindex" or not re.fullmatch(r"[A-Fa-f0-9]{8}(?:-[A-Fa-f0-9]{4}){3}-[A-Fa-f0-9]{12}", session.name):
+        raise ValueError("Invalid desktop session directory")
+    return security.inside(preferences, session.relative_to(preferences))
+
+
+def cmd_record_trash(args: argparse.Namespace) -> int:
+    import media_change_log
+    preferences = Path(args.state_dir).expanduser().resolve()
+    session = desktop_session_path(preferences, Path(args.session_dir))
+    source = Path(os.path.abspath(Path(args.source).expanduser()))
+    relative = source.relative_to(session)
+    if (len(relative.parts) != 3 or relative.parts[0] != "folders"
+            or not re.fullmatch(r"[0-9a-f]{16}", relative.parts[1])
+            or relative.parts[2] not in {"Veronica originals", "recovered-outputs", "rollback-displaced"}):
+        raise ValueError("Unexpected retained-originals folder")
+    source = security.inside(session, relative)
+    target = Path(args.destination).expanduser()
+    if not target.is_absolute() or target.is_symlink() or source.exists() or not target.is_dir():
+        raise ValueError("The original-folder Trash move could not be confirmed")
+    state = source.parent
+    with security.state_access(state):
+        payload = {"timestamp": now_iso(), "operation": "MOVE_ORIGINALS_TO_TRASH",
+                   "source": str(source), "destination": str(target)}
+        group = media_change_log.last_group(state)
+        if group:
+            payload['group'] = group
+        media_change_log.flush_state(state, ("trash:"+sha256_text(str(source)+"|"+str(target)),payload))
+    print(json.dumps({"logged": True}))
+    return 0
+
+
+def cmd_desktop_session(args: argparse.Namespace) -> int:
+    """Recover active transactions, then release scratch data without losing originals.
+
+    The native app moves the returned original folders with FileManager's Trash
+    API. Discard is refused until all originals have left the working area.
+    Older, pre-session state is deliberately outside this command's scope.
+    """
+    preferences = Path(args.state_dir).expanduser().resolve()
+    session = desktop_session_path(preferences, Path(args.session_dir))
+    if not session.exists():
+        print(json.dumps({"original_folders": [], "busy": False}))
+        return 0
+    if not load_product_settings(session).get("desktop_session"):
+        # A launch may exit just after creating its empty lease directory.
+        if any(p.name != ".lease" for p in session.iterdir()):
+            raise ValueError("Unrecognized desktop session; files were retained")
+    lease = os.open(security.inside(session, ".lease"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        if not args.active:
+            try:
+                fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(json.dumps({"original_folders": [], "busy": True}))
+                return 0
+        with contextlib.ExitStack() as locks:
+            locks.enter_context(security.operation_lock(session))
+            security.flush_change_log(session)
+            states = []
+            folder_root = security.inside(session, "folders")
+            if folder_root.exists():
+                for child in sorted(folder_root.iterdir()):
+                    if not re.fullmatch(r"[0-9a-f]{16}", child.name):
+                        raise ValueError("Unrecognized session folder; files were retained")
+                    state = security.inside(session, child.relative_to(session))
+                    locks.enter_context(security.state_access(state))
+                    security.recover_transactions(state)
+                    states.append(state)
+            # A terminated engine cannot write its final status itself. Record
+            # it before releasing the session or removing its retry records.
+            for state in states:
+                media_change_log.finish_action(state, 'interrupted')
+            media_change_log.finish_action(session, 'interrupted')
+            originals = []
+            for state in states:
+                for name in ("Veronica originals", "quarantine"):
+                    quarantine = security.inside(state, name)
+                    if not quarantine.exists() or not any(p.is_file() or p.is_symlink() for p in quarantine.rglob("*")):
+                        continue
+                    # Refuse unknown or modified originals, even when the user
+                    # has quit during a partially completed conversion.
+                    with security.database(state / "media-maintenance.sqlite") as con:
+                        rows = con.execute("SELECT quarantine_path,source_original_sha256 FROM commit_items WHERE status='COMMITTED'").fetchall()
+                    known = {}
+                    for path, digest in rows:
+                        relative_path = Path(path).relative_to(state / "quarantine")
+                        safe = security.inside(quarantine, relative_path)
+                        if safe.exists():
+                            if security.digest(safe) != digest:
+                                raise ValueError("An original changed; the session was retained")
+                            known[safe] = digest
+                    actual = {p for p in quarantine.rglob("*") if p.is_file() or p.is_symlink()}
+                    if actual != set(known):
+                        raise ValueError("Unrecognized recovery files; the session was retained")
+                    # A stable, readable name also makes recovery after a crash
+                    # between this rename and the native Trash call safe.
+                    readable = security.inside(state, "Veronica originals")
+                    if name == "quarantine" and not readable.exists():
+                        quarantine.rename(readable)
+                        security.sync_directory(state)
+                        quarantine = readable
+                    originals.append(str(quarantine))
+                # Displaced files may contain a replacement preserved during
+                # crash recovery. Keep them too, without retaining a ledger.
+                for name in ("recovered-outputs", "rollback-displaced"):
+                    displaced = security.inside(state, name)
+                    if displaced.exists() and any(displaced.rglob("*")):
+                        originals.append(str(displaced))
+            if args.discard:
+                if originals:
+                    raise ValueError("Move session originals to Trash before discarding its temporary data")
+                shutil.rmtree(session)
+            print(json.dumps({"original_folders": originals, "busy": False}))
+        return 0
+    finally:
+        os.close(lease)
+
+
 def main() -> int:
+    security.require_supported_runtime()
     p = argparse.ArgumentParser(description="Veronica engine with resumable workflows and per-file quarantine")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("doctor")
+    psetup = sub.add_parser('prepare-runtime', help='prepare and verify built-in components on first launch')
+    psetup.add_argument('--state-dir', default=DEFAULT_STATE_DIR)
+    plog = sub.add_parser("change-log-status", help="show the permanent change log location")
+    plog.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
+    ptrash = sub.add_parser("record-trash", help=argparse.SUPPRESS)
+    ptrash.add_argument("--state-dir", required=True)
+    ptrash.add_argument("--session-dir", required=True)
+    ptrash.add_argument("--source", required=True)
+    ptrash.add_argument("--destination", required=True)
+    psession = sub.add_parser("desktop-session", help=argparse.SUPPRESS)
+    psession.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
+    psession.add_argument("--session-dir", required=True)
+    psession.add_argument("--active", action="store_true", help=argparse.SUPPRESS)
+    psession.add_argument("--discard", action="store_true", help=argparse.SUPPRESS)
     pm = sub.add_parser("migrate-state", help="dry-run/perform the one-time move from Documents into ~/Library/Application Support/Veronica")
     pm.add_argument("--from-dir", default=LEGACY_STATE_DIR)
     pm.add_argument("--to-dir", default=DEFAULT_STATE_DIR)
@@ -6546,6 +7788,7 @@ def main() -> int:
     panalyze.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
     panalyze.add_argument("--config")
     panalyze.add_argument("--run-date", help="YYYY-MM-DD; defaults to today")
+    panalyze.add_argument("--events-jsonl", help="optional JSON-lines scan progress file for the Veronica GUI")
     paa = sub.add_parser("annual-all", help="run annual maintenance across all configured scan folders using isolated per-folder state")
     paa.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
     paa.add_argument("--config")
@@ -6632,6 +7875,12 @@ def main() -> int:
     prb.add_argument("--commit-id", required=True)
     prb.add_argument("--state-dir", required=True)
     prb.add_argument("--yes", action="store_true", help="required explicit acknowledgement")
+    pdate = sub.add_parser("set-file-date", help="save and verify an embedded date for one inspected file")
+    pdate.add_argument("--state-dir", required=True)
+    pdate.add_argument("--plan", required=True)
+    pdate.add_argument("--relpath", required=True)
+    pdate.add_argument("--date", required=True)
+    pdate.add_argument("--yes", action="store_true")
     prr = sub.add_parser("resolve-review", help="record a guarded durable human resolution for one immutable-plan REVIEW item; never modifies media")
     prr.add_argument("--plan", required=True, help="path to frozen plan JSON containing the REVIEW item")
     prr.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
@@ -6639,6 +7888,19 @@ def main() -> int:
     prr.add_argument("--resolution", choices=["KEEP_AS_IS", "PROCESS_NORMALLY"], required=True)
     prr.add_argument("--note", help="optional human rationale stored in SQLite audit history")
     prr.add_argument("--yes", action="store_true", help="required explicit acknowledgement of the durable database decision")
+    for command in ("folder-settings", "configure-folder", "presets", "save-preset", "delete-preset", "apply-preset", "set-default-preset"):
+        recipe_parser = sub.add_parser(command)
+        recipe_parser.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
+        if command in {"folder-settings", "configure-folder", "apply-preset"}:
+            recipe_parser.add_argument("--folder", required=True)
+        if command in {"configure-folder", "save-preset"}:
+            recipe_parser.add_argument("--recipe-json", required=True)
+        if command == "save-preset":
+            recipe_parser.add_argument("--name", required=True)
+            recipe_parser.add_argument("--preset-id")
+        elif command in {"delete-preset", "apply-preset", "set-default-preset"}:
+            recipe_parser.add_argument("--preset-id", required=True)
+
     pfn = sub.add_parser("configure-filenames", help="store Veronica filename-standardization preferences")
     pfn.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
     pfn.add_argument("--enabled", choices=["true", "false"], required=True)
@@ -6654,18 +7916,22 @@ def main() -> int:
     pmedia.add_argument("--video-extensions")
     pmedia.add_argument("--audio-extensions")
 
+    preset = sub.add_parser("restore-manual-defaults", help="restore manual media, recipe, age and filename defaults without modifying media")
+    preset.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
+
     popt = sub.add_parser("configure-optimization", help="store Veronica optimization recipe preferences")
     popt.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
     popt.add_argument("--image-format", choices=["jpeg", "png"], required=True)
     popt.add_argument("--image-max-megapixels", type=float, required=True)
+    popt.add_argument("--photo-library-max-megapixels", type=float)
     popt.add_argument("--jpeg-quality", type=int, choices=range(30, 96), metavar="[30-95]", required=True)
-    popt.add_argument("--video-max-edge", type=int, choices=range(480, 3841), metavar="[480-3840]", required=True)
+    popt.add_argument("--video-max-edge", type=int, choices=range(480, 7681), metavar="[480-7680]", required=True)
     popt.add_argument("--audio-min-size-mb", type=int, choices=range(1, 501), metavar="[1-500]", required=True)
     popt.add_argument("--allow-camera-metadata-drop", choices=["true", "false"], default="true")
 
     pscope = sub.add_parser("configure-date-scope", help="store Veronica date-scope preferences")
     pscope.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
-    pscope.add_argument("--mode", choices=["all", "within", "outside"], required=True)
+    pscope.add_argument("--mode", choices=["older_than_two_years", "legacy", "all", "within", "outside"], required=True)
     pscope.add_argument("--start", help="inclusive YYYY-MM-DD start date")
     pscope.add_argument("--end", help="inclusive YYYY-MM-DD end date")
 
@@ -6684,6 +7950,15 @@ def main() -> int:
     pui.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
     pui.add_argument("--root", help="optional media library override")
     pui.add_argument("--recent-limit", type=int, default=50)
+    presults = sub.add_parser("scan-results", help="paginated planned changes and unchanged files for the native review window")
+    presults.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
+    presults.add_argument("--scan-id")
+    presults.add_argument("--focus-root")
+    presults.add_argument("--focus-relpath")
+    presults.add_argument("--offset", type=int, default=0)
+    presults.add_argument("--limit", type=int, default=100)
+    presults.add_argument("--category", choices=["all", "changes", "review", "unchanged"], default="all")
+    presults.add_argument("--search", default="")
     ps = sub.add_parser("status")
     ps.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
     prs = sub.add_parser("run-status", help="show unified image/video progress, staging backlog, review counts, and savings")
@@ -6704,7 +7979,30 @@ def main() -> int:
     pcl.add_argument("--state-dir", required=True)
     pcl.add_argument("--staging-id", required=True)
     pcl.add_argument("--apply", action="store_true")
+    # Only the desktop's current-work commands accept a session. Preferences
+    # commands continue to save folder recipes and presets in their usual home.
+    for parser in (panalyze, paa, pui, presults):
+        parser.add_argument("--session-dir", help=argparse.SUPPRESS)
     args = p.parse_args()
+    if args.cmd == 'prepare-runtime':return cmd_prepare_runtime(args)
+    if args.cmd == "change-log-status":
+        import media_change_log
+        print(json.dumps(media_change_log.initialize(Path(args.state_dir).expanduser().resolve())))
+        return 0
+    if args.cmd == "record-trash":
+        return cmd_record_trash(args)
+    if args.cmd == "desktop-session":
+        return cmd_desktop_session(args)
+    if getattr(args, "session_dir", None):
+        preferences = Path(args.state_dir).expanduser().resolve()
+        session = Path(args.session_dir).expanduser()
+        prepare_desktop_session(preferences, session)
+        args.state_dir = str(session)
+    recipe_commands = {"folder-settings": cmd_folder_settings, "configure-folder": cmd_configure_folder,
+        "presets": cmd_presets, "save-preset": cmd_save_preset, "delete-preset": cmd_delete_preset,
+        "apply-preset": cmd_apply_preset, "set-default-preset": cmd_set_default_preset}
+    if args.cmd in recipe_commands:
+        return recipe_commands[args.cmd](args)
     if args.cmd == "doctor": return cmd_doctor()
     if args.cmd == "migrate-state": return cmd_migrate_state(args)
     if args.cmd == "analyze-all": return cmd_analyze_all(args)
@@ -6720,15 +8018,18 @@ def main() -> int:
     if args.cmd == "commit-batch": return cmd_commit_batch(args)
     if args.cmd == "commit-rename": return cmd_commit_rename(args)
     if args.cmd == "rollback": return cmd_rollback(args)
+    if args.cmd == "set-file-date": return cmd_set_file_date(args)
     if args.cmd == "resolve-review": return cmd_resolve_review(args)
     if args.cmd == "configure-filenames": return cmd_configure_filenames(args)
     if args.cmd == "configure-media-types": return cmd_configure_media_types(args)
+    if args.cmd == "restore-manual-defaults": return cmd_restore_manual_defaults(args)
     if args.cmd == "configure-optimization": return cmd_configure_optimization(args)
     if args.cmd == "configure-date-scope": return cmd_configure_date_scope(args)
     if args.cmd == "configure-folders": return cmd_configure_folders(args)
     if args.cmd == "configure-library": return cmd_configure_library(args)
     if args.cmd == "preflight": return cmd_preflight(args)
     if args.cmd == "ui-snapshot": return cmd_ui_snapshot(args)
+    if args.cmd == "scan-results": return cmd_scan_results(args)
     if args.cmd == "status": return cmd_status(args)
     if args.cmd == "run-status": return cmd_run_status(args)
     if args.cmd == "next-batch": return cmd_next_batch(args)

@@ -19,49 +19,14 @@
   "ignore_names": [
     ".DS_Store"
   ],
-  "roots": {
-    "Streams": {
-      "mode": "audit",
-      "expected_subfolders": {
-        "Image": "image",
-        "Video": "video",
-        "Audio": "audio"
-      }
-    },
-    "Photo_Library": {
-      "mode": "audit_cautious",
-      "protected_directory_names": [
-        "RAW",
-        "Capture",
-        "CaptureOne",
-        "Photoshop",
-        "Original",
-        "Retouch",
-        "Assets",
-        "Unused",
-        "Masters",
-        "Master",
-        "Source",
-        "Working",
-        "Negatives"
-      ]
-    },
-    "Imagehead": {
-      "mode": "read_only_archive"
-    }
-  },
+  "roots": {},
   "audio_min_size_mb": 10,
-  "streams_image_max_megapixels": 10,
-  "photo_library_max_megapixels": 20,
   "video_preset_file": "preset-720P.json",
   "policies": {
-    "streams_image": "streams-image-10mp-v1",
-    "photo_library_image": "photo-library-image-20mp-v1",
     "streams_video": "streams-video-handbrake-square-pixel-720p-v4-no-autocrop",
-    "streams_audio": "streams-audio-mp3-128k-v1"
+    "streams_audio": "streams-audio-mp3-128k-v1",
+    "image": "image-folder-recipe-v2"
   },
-  "streams_jpeg_quality": 50,
-  "photo_library_jpeg_quality": 70,
   "minimum_saving_percent": 10.0,
   "minimum_saving_bytes": 1048576,
   "stage_copy_personal_finder_tags": true,
@@ -81,5 +46,12 @@
   "video_require_square_pixels": true,
   "video_crop_policy": "full-frame-no-autocrop",
   "video_require_full_frame": true,
-  "video_full_frame_dimension_tolerance_pixels": 2
+  "video_full_frame_dimension_tolerance_pixels": 2,
+  "recompress_images_below_target": true,
+  "filename_standardization_enabled": true,
+  "filename_date_format": "YYMMDD-",
+  "filename_max_bytes": 60,
+  "image_max_megapixels": 20,
+  "jpeg_quality": 70,
+  "excluded_directory_names": []
 }

@@ -77,8 +77,8 @@ def main() -> int:
         assert a.decide(unknown).action == "REVIEW"
 
         settings = mm.date_scope_product_settings(state, dt.date(2026, 9, 24))
-        assert settings["mode"] == "legacy"
-        assert settings["end"] == "2024-12-31"
+        assert settings["mode"] == "older_than_two_years"
+        assert settings["end"] == "2024-09-23"
 
     print("date scope regression: PASS")
     return 0

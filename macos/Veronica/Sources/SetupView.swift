@@ -23,7 +23,7 @@ struct SetupView: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
 
-            Text("Veronica stores its database, plans, reports, staging, and quarantine in ~/Library/Application Support/Veronica.")
+            Text("Your folder settings stay saved. Each launch starts fresh, and replaced originals go to the Mac Trash.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

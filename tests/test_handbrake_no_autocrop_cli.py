@@ -22,33 +22,33 @@ def run_case(width, height, dar, expected):
         preset.write_text(json.dumps({'PresetList':[{'PresetName':'TEST'}]}))
         captured = {}
 
-        old_which = mm.shutil.which
+        old_which = mm.security.resolve_tool
         old_probe = mm.ffprobe_json
         old_summary = mm.video_stream_summary
-        old_run = mm.subprocess.run
+        old_run = mm.security.bounded_run
         old_tags = mm.copy_personal_finder_tags_xattr
         old_fs = mm.restore_stage_filesystem_metadata
         try:
-            mm.shutil.which = lambda name: '/usr/local/bin/HandBrakeCLI' if name == 'HandBrakeCLI' else old_which(name)
+            mm.security.resolve_tool = lambda name: '/usr/local/bin/HandBrakeCLI' if name == 'HandBrakeCLI' else old_which(name)
             mm.ffprobe_json = lambda p: {'streams': []}
             mm.video_stream_summary = lambda info: {
                 'width': width, 'height': height,
                 'display_aspect_ratio_value': dar,
                 'rotation': 0,
             }
-            def fake_run(cmd, capture_output=False, text=False):
+            def fake_run(cmd, **kwargs):
                 captured['cmd'] = cmd
                 Path(cmd[cmd.index('-o') + 1]).write_bytes(b'out')
                 return SimpleNamespace(returncode=0, stdout='', stderr='')
-            mm.subprocess.run = fake_run
+            mm.security.bounded_run = fake_run
             mm.copy_personal_finder_tags_xattr = lambda a,b,c: (True,'no_tags',[])
             mm.restore_stage_filesystem_metadata = lambda a,b: {'ok': True}
             result = mm.convert_video_stage(src, dst, {'target': {'preset': str(preset)}}, {'video_max_storage_edge':1280, 'stage_copy_personal_finder_tags':True}, td)
         finally:
-            mm.shutil.which = old_which
+            mm.security.resolve_tool = old_which
             mm.ffprobe_json = old_probe
             mm.video_stream_summary = old_summary
-            mm.subprocess.run = old_run
+            mm.security.bounded_run = old_run
             mm.copy_personal_finder_tags_xattr = old_tags
             mm.restore_stage_filesystem_metadata = old_fs
 
