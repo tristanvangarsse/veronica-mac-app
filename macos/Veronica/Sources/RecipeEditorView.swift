@@ -92,7 +92,7 @@ struct RecipeEditorView: View {
                             .padding(.horizontal, 12).padding(.vertical, 11)
                             .background(pane == item ? VeronicaTheme.accentFill : .clear, in: RoundedRectangle(cornerRadius: 10))
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(VeronicaPlainButtonStyle())
                     .foregroundStyle(pane == item ? VeronicaTheme.accent : VeronicaTheme.ink)
                     .accessibilityIdentifier("veronica.recipe.pane.\(item.id)")
                 }
@@ -393,7 +393,7 @@ struct RecipeChoiceMenu<Value: Hashable>: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
         }
-        .menuStyle(.borderlessButton).menuIndicator(.hidden)
+        .menuStyle(.button).buttonStyle(VeronicaPlainButtonStyle()).menuIndicator(.hidden)
         .accessibilityLabel(title)
         .accessibilityValue(choices.first { $0.0 == selection }?.1 ?? "Custom")
     }
@@ -421,7 +421,7 @@ struct SettingsDisclosure<Content: View>: View {
                 .frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 5)
                 .contentShape(Rectangle())
             }
-            .buttonStyle(.plain).accessibilityLabel(title)
+            .buttonStyle(VeronicaPlainButtonStyle()).accessibilityLabel(title)
             .accessibilityValue(expanded ? "Expanded" : "Collapsed")
             if expanded { content }
         }.frame(maxWidth: .infinity, alignment: .leading)
@@ -554,7 +554,7 @@ private struct RecipeExtensionGroup: View {
                             .foregroundStyle(enabled.contains(ext) ? Color.white : VeronicaTheme.secondaryInk)
                             .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(enabled.contains(ext) ? Color.clear : VeronicaTheme.border))
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(VeronicaPlainButtonStyle())
                     .accessibilityLabel(ext.uppercased() + " " + title.lowercased())
                     .accessibilityValue(enabled.contains(ext) ? "Enabled" : "Disabled")
                     .accessibilityIdentifier("veronica.recipe.format" + ext)

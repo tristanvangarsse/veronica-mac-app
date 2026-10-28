@@ -146,7 +146,7 @@ private struct ReviewItemRow: View {
             } label: {
                 ReviewThumbnail(url: url)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(VeronicaPlainButtonStyle())
             .help("Preview")
         }
     }

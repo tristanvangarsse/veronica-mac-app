@@ -26,8 +26,8 @@ struct SettingsView: View {
                 HStack {
                     Text(errorMessage).font(.callout).foregroundStyle(.red)
                     Spacer()
-                    Button { self.errorMessage = nil } label: { Image(systemName: "xmark") }
-                        .buttonStyle(.plain).accessibilityLabel("Dismiss error")
+                    Button { self.errorMessage = nil } label: { Image(systemName: "xmark").frame(width: 28, height: 28) }
+                        .buttonStyle(VeronicaPlainButtonStyle()).accessibilityLabel("Dismiss error")
                 }.padding(14)
             }
             TabView(selection: $selectedTab) {
