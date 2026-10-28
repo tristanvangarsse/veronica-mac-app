@@ -112,7 +112,7 @@ struct ScanResultsView: View {
                     .background(category == value ? VeronicaTheme.accentFill : .clear, in: RoundedRectangle(cornerRadius: 11))
                     .foregroundStyle(category == value ? VeronicaTheme.accent : VeronicaTheme.ink)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(VeronicaPlainButtonStyle())
                 .accessibilityIdentifier("veronica.filter.\(value)")
             }
             Spacer()
