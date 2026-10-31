@@ -10,6 +10,7 @@
 - Builds support both current and older Homebrew ExifTool launcher layouts while retaining strict checks against external runtime paths.
 - Source-mode date editing and first-run checks also resolve the actual Perl program directly in both layouts, keeping shell execution disabled.
 - Retains independent folder settings, local processing, recoverable originals, and the existing unsigned beta installation route.
+- Sizes the expanded review window using the space below its toolbar, keeping the cleanup footer fully visible.
 
 ## 0.13.2 - Native diagnostics workflow
 

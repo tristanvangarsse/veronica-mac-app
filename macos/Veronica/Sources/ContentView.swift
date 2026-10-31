@@ -51,9 +51,14 @@ private struct WindowChromeConfigurator: NSViewRepresentable {
         window.collectionBehavior.insert(.fullScreenNone)
         window.standardWindowButton(.zoomButton)?.isHidden = true
         let size = VeronicaWindowMetrics.size(reviewing: reviewing)
-        let content = window.contentRect(forFrameRect: window.frame)
+        // SwiftUI uses a full-size content view. contentRect includes its
+        // unified toolbar, but the fixed SwiftUI view is laid out below it.
+        let content = window.contentLayoutRect
         let needsResize = abs(content.width - size.width) > 1 || abs(content.height - size.height) > 1
-        var frame = window.frameRect(forContentRect: NSRect(origin: .zero, size: size))
+        let chrome = CGSize(width: max(0, window.frame.width - content.width),
+                            height: max(0, window.frame.height - content.height))
+        var frame = NSRect(origin: .zero,
+                           size: CGSize(width: size.width + chrome.width, height: size.height + chrome.height))
         frame.origin = needsResize
             ? NSPoint(x: window.frame.midX - frame.width / 2, y: window.frame.maxY - frame.height)
             : window.frame.origin
