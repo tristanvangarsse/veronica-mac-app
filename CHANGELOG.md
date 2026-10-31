@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.16.0 beta 3
+
+- Shows the specific reason a file needs review before its preview, with a matching title in the file list and clear next steps. Combined safety risks are all explained; technical codes remain available in a disclosure.
+- Describes missing dates, unreadable or empty files, filename conflicts, unsupported formats, HDR, frame timing, camera metadata and extra tracks without guessing what failed.
+- Keeps converted filename extensions consistent with the output format even when date/name standardization is disabled.
+- Releases verified backup copies after a recovered failed write through the normal originals-to-Trash workflow. Changed or unrecognized recovery files still block session disposal.
+- Adds a direct feedback link in Settings → Support and structured GitHub forms for bug reports and beta feedback.
+- Builds support both current and older Homebrew ExifTool launcher layouts while retaining strict checks against external runtime paths.
+- Source-mode date editing and first-run checks also resolve the actual Perl program directly in both layouts, keeping shell execution disabled.
+- Retains independent folder settings, local processing, recoverable originals, and the existing unsigned beta installation route.
+- Sizes the expanded review window using the space below its toolbar, keeping the cleanup footer fully visible.
+
 ## 0.13.2 - Native diagnostics workflow
 
 - Adds persistent local logging under `~/Library/Application Support/Veronica/logs/veronica.log` with bounded log rotation.

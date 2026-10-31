@@ -279,6 +279,12 @@ struct ScanResultItem: Decodable, Identifiable {
     }
     var filename: String { fileURL.lastPathComponent }
     var dateEditingUnavailableReason: String {
+        if reason == "empty_file" {
+            return "There is no media content in this empty file to add a date to."
+        }
+        if reason == "media_probe_failed" || reason == "video_source_probe_failed" {
+            return "Date editing is unavailable because this file could not be read safely."
+        }
         if reason == "excluded_directory" {
             return "Date editing is disabled because this file is in a skipped subfolder."
         }
@@ -289,6 +295,7 @@ struct ScanResultItem: Decodable, Identifiable {
     }
     var actionTitle: String {
         guard category != "unchanged" else { return "Keep unchanged" }
+        if category == "review" { return reviewExplanation.title }
         switch operation {
         case "CONVERT_IMAGE": return "Optimize image"
         case "CONVERT_VIDEO": return "Optimize video"
@@ -298,6 +305,7 @@ struct ScanResultItem: Decodable, Identifiable {
         default: return "Keep unchanged"
         }
     }
+    var reviewExplanation: ReviewExplanation { ReviewExplanation(reason: reason) }
     enum CodingKeys: String, CodingKey {
         case root, relpath, operation, reason, category, detail, destination
         case stateDir = "state_dir"
@@ -532,98 +540,143 @@ struct ReviewItem: Codable, Identifiable {
         return count > 0
     }
 
-    var category: String {
-        if reason == "embedded_date_missing" { return "Date evidence" }
-        if reason.contains("dolby_vision") || reason.contains("hdr_transfer") || reason.contains("wide_gamut") {
-            return "Color quality"
+    var reviewExplanation: ReviewExplanation { ReviewExplanation(reason: reason) }
+    var category: String { reviewExplanation.category }
+    var recommendedAction: String { reviewExplanation.nextStep }
+    var title: String { reviewExplanation.title }
+    var explanation: String { reviewExplanation.explanation }
+}
+
+/// One presentation for review reasons in both the results browser and Review.
+/// Keep the original code for diagnostics; never mistake an unknown check for approval.
+struct ReviewExplanation {
+    let category: String
+    let title: String
+    let explanation: String
+    let nextStep: String
+    let isKnown: Bool
+
+    init(reason: String) {
+        let prefix = "video_source_review:"
+        let codes = reason.hasPrefix(prefix) ? String(reason.dropFirst(prefix.count)) : reason
+        let checks = codes.split(separator: ",").map { Self.describe(String($0)) }
+        if checks.count == 1, let check = checks.first {
+            self = check
+        } else if !checks.isEmpty {
+            category = "Multiple safety checks"
+            title = "\(checks.count) reasons to keep this file unchanged"
+            explanation = checks.map { "\($0.title): \($0.explanation)" }.joined(separator: "\n\n")
+            nextStep = "Keep the original. Every safety check must be addressed before Veronica can convert this file."
+            isKnown = checks.allSatisfy(\.isKnown)
+        } else {
+            self = Self.describe("")
         }
-        if reason.contains("variable_frame_rate")
-            || reason.contains("frame_count_mismatch")
-            || reason.contains("non_monotonic_frame_timestamps")
-            || reason.contains("duplicate_frame_timestamps") {
-            return "Motion timing"
-        }
-        if reason.contains("multiple_audio_streams")
-            || reason.contains("multichannel_audio")
-            || reason.contains("extra_subtitle_streams")
-            || reason.contains("chapters_present")
-            || reason.contains("extra_attachment_streams")
-            || reason.contains("video_stream_count") {
-            return "Extra tracks"
-        }
-        if reason.contains("date_low_confidence")
-            || reason.contains("date_conflict")
-            || reason.contains("date_unknown")
-            || reason.contains("no_eligibility_date") {
-            return "Date evidence"
-        }
-        if reason.contains("legacy_v2_but_image_exceeds_current_target") {
-            return "Previous optimization"
-        }
-        return "Needs decision"
     }
 
-    var recommendedAction: String {
-        if reason == "embedded_date_missing" { return "Keep the original. Veronica needs a usable date stored inside the file." }
-        if category == "Color quality" {
-            return "Keep the original unless you are comfortable losing HDR or Dolby Vision behavior."
-        }
-        if category == "Motion timing" {
-            return "Preview first. Keep the original if smooth playback matters."
-        }
-        if category == "Extra tracks" {
-            return "Keep the original if subtitles, chapters, surround audio, or alternate tracks matter."
-        }
-        if category == "Date evidence" {
-            return "Only needed when date-based organization or date ranges are active."
-        }
-        return "Preview the file, then choose whether Veronica should leave it unchanged."
+    private init(_ category: String, _ title: String, _ explanation: String, _ nextStep: String, known: Bool = true) {
+        self.category = category
+        self.title = title
+        self.explanation = explanation
+        self.nextStep = nextStep
+        self.isKnown = known
     }
 
-    var title: String {
-        if reason == "embedded_date_missing" { return "No embedded date" }
-        if category == "Color quality" { return "HDR or Dolby Vision video" }
-        if reason.contains("variable_frame_rate") { return "Video timing may change" }
-        if reason.contains("frame_count_mismatch") { return "Video timing is inconsistent" }
-        if reason.contains("date_low_confidence") { return "Date needs review" }
-        if reason.contains("date_conflict") { return "Conflicting dates" }
-        if reason.contains("multiple_audio_streams") { return "Multiple audio tracks" }
-        if reason.contains("multichannel_audio") { return "Surround audio" }
-        if reason.contains("extra_subtitle_streams") { return "Subtitle tracks" }
-        if reason.contains("chapters_present") { return "Video chapters" }
-        if reason.contains("apple_quicktime_metadata_streams") { return "Camera metadata" }
-        if reason.contains("legacy_v2_but_image_exceeds_current_target") { return "Previously processed large image" }
-        if reason.contains("category_mismatch") { return "Media type does not match its folder" }
-        if reason.contains("empty_file") { return "Empty file" }
-        return "Needs review"
-    }
-
-    var explanation: String {
-        if reason == "embedded_date_missing" {
-            return "This file has no usable embedded date. It stays unchanged until its date can be read from inside the file."
+    private static func describe(_ code: String) -> Self {
+        let key = String(code.split(separator: ":", maxSplits: 1).first ?? "")
+        switch key {
+        case "embedded_date_missing", "date_unknown", "no_eligibility_date":
+            return Self("File date", "No usable date inside the file",
+                        "Veronica could not find a usable embedded date. It will not guess from the filename or Finder dates, so this file has been left unchanged.",
+                        "If you know the correct date, choose Add date below. Otherwise, keep the original unchanged.")
+        case "date_conflict":
+            return Self("File date", "The file contains conflicting dates",
+                        "The available date evidence disagrees. Using the wrong date could put the file in the wrong date range or give it an incorrect filename.",
+                        "Check the date, then use Edit date if available. Approve normal processing only if you accept the selected date.")
+        case "date_low_confidence":
+            return Self("File date", "The file date is uncertain",
+                        "The available date evidence is not reliable enough to choose a date safely.",
+                        "Check the date, then use Edit date if available, or keep the original unchanged.")
+        case "empty_file":
+            return Self("File contents", "The file is empty",
+                        "This file contains zero bytes. There is no media content for Veronica to read or optimize.",
+                        "Check your original or backup. Veronica cannot repair an empty file.")
+        case "media_probe_failed", "video_source_probe_failed":
+            return Self("File contents", "The media could not be read safely",
+                        "Veronica could not inspect this file's media information. The file may be incomplete, unavailable, damaged, or use an unsupported format; this check does not establish which.",
+                        "Try opening the original in another app. If it plays correctly, keep it unchanged and inspect Technical details or export diagnostics.")
+        case "image_dimensions_unknown":
+            return Self("Image size", "The image size could not be read",
+                        "Veronica could not determine this image's dimensions, so it cannot choose or verify a safe resize.",
+                        "Preview the original and check that it opens correctly. Keep it unchanged until its dimensions can be read.")
+        case "filename_collision", "unicode_or_case_name_collision":
+            return Self("Filename", "A filename conflicts with another file",
+                        "A filename would conflict with another file, including names that differ only by letter case or equivalent Unicode characters. Veronica will not overwrite either file.",
+                        "Give the conflicting files distinct names, then scan again.")
+        case "category_mismatch":
+            return Self("Media type", "The media type does not match its expected category",
+                        "The detected media type differs from the category expected for this file. Veronica has stopped rather than apply the wrong conversion rules.",
+                        "Check the file's contents and location, then scan again or keep it unchanged.")
+        case "invalid_date_scope":
+            return Self("Folder settings", "The folder's date range is invalid",
+                        "Veronica cannot apply the selected date range safely.",
+                        "Open this folder's settings, correct the date range, and scan again.")
+        case "legacy_v2_but_image_exceeds_current_target":
+            return Self("Previous optimization", "An earlier optimization used a larger image size",
+                        "A legacy processing tag marks this image as processed, but its dimensions exceed this folder's current size limit. Veronica will not automatically recompress it.",
+                        "Compare the image with your current settings and keep the original unless you deliberately want another conversion.")
+        case "hdr_transfer", "wide_gamut", "dolby_vision", "dolby_vision_side_data", "hdr_mastering_metadata":
+            return Self("Color quality", "HDR or wide-gamut color needs protection",
+                        "This video contains HDR, Dolby Vision, or wide-gamut color information. The current conversion cannot guarantee preserving its brightness and colors.",
+                        "Keep the original to preserve its color information. Automatic conversion is blocked.")
+        case "variable_frame_rate":
+            return Self("Motion timing", "Video frame timing may change",
+                        "The video uses variable frame timing. Conversion could change motion smoothness or audio synchronization.",
+                        "Keep the original. Previewing alone cannot verify that a conversion would preserve its timing.")
+        case "frame_count_mismatch":
+            return Self("Motion timing", "The video's frame counts disagree",
+                        "The declared frame count does not agree with the inspected frame timing. Veronica cannot verify a safe conversion.",
+                        "Keep the original and check playback. Automatic conversion is blocked.")
+        case "non_monotonic_frame_timestamps", "duplicate_frame_timestamps":
+            return Self("Motion timing", "Video frame timestamps are inconsistent",
+                        "Some video frames have repeated or out-of-order timestamps. Conversion could alter timing or audio synchronization.",
+                        "Keep the original and check playback. Automatic conversion is blocked.")
+        case "multiple_audio_streams":
+            return Self("Audio tracks", "The video has multiple audio tracks",
+                        "This video contains more than one audio track. Conversion could discard an alternate language or other audio track.",
+                        "Keep the original to preserve every audio track.")
+        case "multichannel_audio":
+            return Self("Audio channels", "Surround audio needs protection",
+                        "This video has more than two audio channels. The current conversion could reduce surround audio to stereo.",
+                        "Keep the original to preserve its audio channels.")
+        case "extra_subtitle_streams":
+            return Self("Subtitle tracks", "The video contains subtitles",
+                        "This video has subtitle tracks that the current conversion does not guarantee preserving.",
+                        "Keep the original to preserve its subtitles.")
+        case "chapters_present":
+            return Self("Video chapters", "The video contains chapter markers",
+                        "This video has chapter markers. Veronica cannot currently verify that every chapter would survive conversion.",
+                        "Keep the original to preserve its chapters.")
+        case "apple_quicktime_metadata_streams":
+            return Self("Camera metadata", "Conversion would remove camera metadata tracks",
+                        "This QuickTime video contains Apple Core Media metadata tracks that Veronica's MP4 conversion does not preserve. These are additional tracks, separate from the picture and sound.",
+                        "Keep the original to retain these tracks. Process Normally explicitly accepts their removal; other safety checks still apply.")
+        case "extra_data_streams", "extra_attachment_streams":
+            return Self("Additional tracks", "The video contains additional data or attachments",
+                        "This video includes data tracks or attachments that Veronica cannot guarantee preserving during conversion.",
+                        "Keep the original to preserve these additional contents.")
+        case "video_stream_count":
+            return Self("Video tracks", "The video track layout needs protection",
+                        "Veronica expected exactly one video track but found a different track layout. It cannot safely choose what to convert or discard.",
+                        "Keep the original to preserve every track.")
+        case "no_media_conversion_policy", "no_phase2_policy", "unclassified_content":
+            return Self("Supported formats", "No supported conversion is available",
+                        "Veronica does not have a verified conversion policy for this media type.",
+                        "Keep the original unchanged. Do not change its extension to force conversion.")
+        default:
+            return Self("Safety check", "A safety check needs attention",
+                        "Veronica could not establish that this file can be changed safely, so it has been left unchanged.",
+                        "Keep the original. Open Technical details or export diagnostics to investigate the unrecognized check.", known: false)
         }
-        if category == "Color quality" {
-            return "This video carries HDR, Dolby Vision, or wide-gamut color information. A standard optimization can change how it looks, so Veronica will not transcode it automatically."
-        }
-        if reason.contains("variable_frame_rate") {
-            return "The video uses variable frame timing. Transcoding can alter motion smoothness or audio sync, even when duration checks pass."
-        }
-        if reason.contains("frame_count_mismatch") {
-            return "The container's declared frame count does not agree with decoded frame timing, so automatic conversion is blocked."
-        }
-        if category == "Extra tracks" {
-            return "This file contains extra streams such as alternate audio, subtitles, chapters, attachments, or surround channels. Veronica does not assume those can be discarded."
-        }
-        if reason.contains("date_low_confidence") {
-            return "The available date evidence is not strong enough for date-based organization."
-        }
-        if reason.contains("apple_quicktime_metadata_streams") {
-            return "This QuickTime video contains Apple Core Media metadata tracks that are not preserved by Veronica's MP4 conversion. You can approve normal processing or keep the original unchanged."
-        }
-        if reason.contains("legacy_v2_but_image_exceeds_current_target") {
-            return "This image was historically processed, but it is larger than today's dimensional target."
-        }
-        return reason
     }
 }
 

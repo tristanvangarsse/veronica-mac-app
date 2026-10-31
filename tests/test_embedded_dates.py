@@ -113,8 +113,8 @@ def main():
         source=base/'main.swift'
         source.write_text('''import Foundation
 let item = ReviewItem(root: "/tmp", stateDir: "/tmp/state", relpath: "file.jpg", reason: "embedded_date_missing", sourceSize: 100, planPath: nil)
-assert(item.title == "No embedded date" && !item.canProcessNormally)
-assert(item.explanation.contains("stays unchanged"))
+assert(item.title.lowercased().contains("date") && !item.canProcessNormally)
+assert(item.explanation.contains("left unchanged") && item.explanation.contains("will not guess"))
 print("Missing embedded dates cannot be approved for normal processing: PASS")
 ''')
         binary=base/'check'

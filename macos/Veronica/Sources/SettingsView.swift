@@ -26,8 +26,8 @@ struct SettingsView: View {
                 HStack {
                     Text(errorMessage).font(.callout).foregroundStyle(.red)
                     Spacer()
-                    Button { self.errorMessage = nil } label: { Image(systemName: "xmark") }
-                        .buttonStyle(.plain).accessibilityLabel("Dismiss error")
+                    Button { self.errorMessage = nil } label: { Image(systemName: "xmark").frame(width: 28, height: 28) }
+                        .buttonStyle(VeronicaPlainButtonStyle()).accessibilityLabel("Dismiss error")
                 }.padding(14)
             }
             TabView(selection: $selectedTab) {
@@ -166,6 +166,10 @@ struct SettingsView: View {
                     .accessibilityIdentifier("veronica.showChangeLogs")
             }
             Section("Help with a problem") {
+                Link("Report a problem or share beta feedback…", destination: URL(string: "https://github.com/tristanvangarsse/veronica-mac-app/issues/new/choose")!)
+                    .accessibilityIdentifier("veronica.sendFeedback")
+                Text("Opens GitHub in your browser. Nothing is sent automatically. You can also reply to the Reddit beta thread.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Text("Export a report to help investigate a problem. Media filenames are omitted from the report.")
                     .font(.callout).foregroundStyle(.secondary)
                 HStack {

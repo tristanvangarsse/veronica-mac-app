@@ -16,7 +16,7 @@ struct ReviewView: View {
                 Text("Review")
                     .font(.largeTitle.bold())
 
-                Text("These files are still safe where they are. Veronica is asking because optimizing them could change quality, timing, tracks, or date-based organization.")
+                Text("These files have been left unchanged. Each explanation tells you which check stopped Veronica and what you can do next.")
                     .foregroundStyle(.secondary)
             }
 
@@ -67,7 +67,7 @@ struct ReviewView: View {
                 pendingKeep = nil
             }
         } message: {
-            Text("This records a guarded review decision in Veronica's database. The media file itself is not modified, and the decision is reused only while the source identity and review reason still match.")
+            Text("This keeps the file unchanged for this scan. The decision applies only while the file and review reason still match. A new app session scans files afresh.")
         }
         .confirmationDialog(
             "Let Veronica process this file normally?",
@@ -146,7 +146,7 @@ private struct ReviewItemRow: View {
             } label: {
                 ReviewThumbnail(url: url)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(VeronicaPlainButtonStyle())
             .help("Preview")
         }
     }
@@ -163,9 +163,14 @@ private struct ReviewItemRow: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
             Text(item.explanation)
-                .font(.caption)
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
             Text(item.recommendedAction)
-                .font(.caption)
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+            DisclosureGroup("Technical details") {
+                Text(item.reason).font(.caption.monospaced()).textSelection(.enabled)
+            }
             Text(formattedSize)
                 .font(.caption2)
         }

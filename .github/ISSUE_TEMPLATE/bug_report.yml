@@ -1,0 +1,46 @@
+name: Bug report
+description: Report an installation, processing, review or recovery problem.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: "Thanks for testing Veronica. This report is public. Do not include private media, filenames, full paths or unreviewed logs."
+  - type: input
+    id: version
+    attributes:
+      label: Veronica version and build
+      placeholder: "For example: 0.16.0, build 11 (About Veronica)"
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: macOS version and Mac chip
+      placeholder: "For example: macOS 26, Apple M2"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: What did you do?
+      description: Include the relevant folder settings and steps. Use generic file names.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect, and what actually happened?
+    validations:
+      required: true
+  - type: textarea
+    id: originals
+    attributes:
+      label: Are the originals intact, and can you reproduce this with disposable copies?
+      description: If you suspect a data problem, stop further cleanup and keep the originals and recovery files.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Optional screenshot or diagnostic ZIP
+      description: Export from Settings → Support. Check the contents for private information yourself before attaching. Do not upload the dated change logs unchanged.

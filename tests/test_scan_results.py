@@ -97,6 +97,19 @@ print("Swift full scan results contract: PASS")
         assert 'scan changed' in run('scan-results', '--scan-id', scan_id, success=False)
         after = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for folder in folders for p in folder.iterdir()}
         assert before == after, 'Scanning and reviewing must leave every source unchanged'
+
+        # Missing dates in readable media can be repaired. Empty/unreadable
+        # media must not invite a date write which cannot succeed safely.
+        (folders[0] / 'empty.jpg').write_bytes(b'')
+        (folders[0] / 'unreadable.jpg').write_bytes(b'Generated invalid image')
+        Image.new('RGB', (40, 30), 'purple').save(folders[0] / 'undated.jpg')
+        review_sources = {p.name: p.read_bytes() for p in folders[0].glob('*.jpg')}
+        run('analyze-all')
+        review = {x['relpath']: x for x in run('scan-results', '--category', 'review')['items']}
+        assert review['empty.jpg']['reason'] == 'empty_file' and not review['empty.jpg']['can_edit_date']
+        assert review['unreadable.jpg']['reason'] == 'media_probe_failed' and not review['unreadable.jpg']['can_edit_date']
+        assert review['undated.jpg']['reason'] == 'embedded_date_missing' and review['undated.jpg']['can_edit_date']
+        assert review_sources == {p.name: p.read_bytes() for p in folders[0].glob('*.jpg')}
     print('Full scan results, pagination, independent recipes, stale-plan rejection and read-only review: PASS')
 
 

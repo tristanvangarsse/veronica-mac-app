@@ -51,9 +51,14 @@ private struct WindowChromeConfigurator: NSViewRepresentable {
         window.collectionBehavior.insert(.fullScreenNone)
         window.standardWindowButton(.zoomButton)?.isHidden = true
         let size = VeronicaWindowMetrics.size(reviewing: reviewing)
-        let content = window.contentRect(forFrameRect: window.frame)
+        // SwiftUI uses a full-size content view. contentRect includes its
+        // unified toolbar, but the fixed SwiftUI view is laid out below it.
+        let content = window.contentLayoutRect
         let needsResize = abs(content.width - size.width) > 1 || abs(content.height - size.height) > 1
-        var frame = window.frameRect(forContentRect: NSRect(origin: .zero, size: size))
+        let chrome = CGSize(width: max(0, window.frame.width - content.width),
+                            height: max(0, window.frame.height - content.height))
+        var frame = NSRect(origin: .zero,
+                           size: CGSize(width: size.width + chrome.width, height: size.height + chrome.height))
         frame.origin = needsResize
             ? NSPoint(x: window.frame.midX - frame.width / 2, y: window.frame.maxY - frame.height)
             : window.frame.origin
@@ -102,6 +107,17 @@ struct VeronicaPrimaryButtonStyle: ButtonStyle {
                         in: RoundedRectangle(cornerRadius: 12))
             .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(enabled ? VeronicaTheme.actionInk.opacity(0.10) : VeronicaTheme.border.opacity(0.4)))
             .contentShape(RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+struct VeronicaPlainButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var enabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            // Include the label's frame, padding and spacer in mouse hit testing.
+            .contentShape(Rectangle())
+            .opacity(enabled ? (configuration.isPressed ? 0.72 : 1) : 0.45)
     }
 }
 
@@ -204,8 +220,8 @@ struct ContentView: View {
                     Image(systemName: "exclamationmark.triangle")
                     Text(message).font(.caption).textSelection(.enabled)
                     Spacer(minLength: 4)
-                    Button { model.dismissError() } label: { Image(systemName: "xmark") }
-                        .buttonStyle(.plain).accessibilityLabel("Dismiss message")
+                    Button { model.dismissError() } label: { Image(systemName: "xmark").frame(width: 28, height: 28) }
+                        .buttonStyle(VeronicaPlainButtonStyle()).accessibilityLabel("Dismiss message")
                 }
                 .foregroundStyle(.secondary)
                 .padding(14)
@@ -277,7 +293,7 @@ struct ContentView: View {
                             .frame(width: 112, height: 100)
                             .background(VeronicaTheme.accentFill, in: RoundedRectangle(cornerRadius: 30))
                     }
-                    .buttonStyle(.plain).foregroundStyle(VeronicaTheme.accent)
+                    .buttonStyle(VeronicaPlainButtonStyle()).foregroundStyle(VeronicaTheme.accent)
                     .disabled(!model.hasLiveSnapshot || busy)
                     .accessibilityLabel("Add a folder").accessibilityIdentifier("veronica.addFirstFolder")
                 }
@@ -303,8 +319,9 @@ struct ContentView: View {
                 .frame(maxHeight: .infinity)
                 Button { Task { await model.addScanFolders() } } label: {
                     Label("Add another folder…", systemImage: "plus")
+                        .padding(.horizontal, 10).padding(.vertical, 6)
                 }
-                .buttonStyle(.plain).foregroundStyle(VeronicaTheme.accent)
+                .buttonStyle(VeronicaPlainButtonStyle()).foregroundStyle(VeronicaTheme.accent)
                 .disabled(!model.hasLiveSnapshot || busy)
                 .accessibilityIdentifier("veronica.addFolder")
             }
@@ -342,13 +359,13 @@ struct ContentView: View {
             }
             .help(path)
             Spacer(minLength: 8)
-            Button { folderSettingsSelection = settings } label: { Image(systemName: "slider.horizontal.3") }
-                .buttonStyle(.borderless).disabled(busy || settings == nil || !model.hasLiveSnapshot)
+            Button { folderSettingsSelection = settings } label: { Image(systemName: "slider.horizontal.3").frame(width: 28, height: 28) }
+                .buttonStyle(VeronicaPlainButtonStyle()).disabled(busy || settings == nil || !model.hasLiveSnapshot)
                 .accessibilityLabel("Settings for \(URL(fileURLWithPath: path).lastPathComponent)")
                 .accessibilityIdentifier("veronica.folderSettings")
                 .help("Folder settings")
-            Button { Task { await model.removeScanFolder(path) } } label: { Image(systemName: "minus.circle") }
-                .buttonStyle(.borderless).disabled(busy || !model.hasLiveSnapshot)
+            Button { Task { await model.removeScanFolder(path) } } label: { Image(systemName: "minus.circle").frame(width: 28, height: 28) }
+                .buttonStyle(VeronicaPlainButtonStyle()).disabled(busy || !model.hasLiveSnapshot)
                 .accessibilityLabel("Remove \(URL(fileURLWithPath: path).lastPathComponent)")
         }
         .padding(14)
@@ -407,8 +424,10 @@ struct ContentView: View {
                     .buttonStyle(VeronicaPrimaryButtonStyle()).controlSize(.large).disabled(!canCleanup)
                     .accessibilityIdentifier("veronica.smartCleanup")
             }
-            Button("Back to folders") { model.analysisCompleted = false; reviewing = false }
-                .buttonStyle(.plain).font(.callout).foregroundStyle(.secondary)
+            Button { model.analysisCompleted = false; reviewing = false } label: {
+                Text("Back to folders").padding(.horizontal, 10).padding(.vertical, 6)
+            }
+                .buttonStyle(VeronicaPlainButtonStyle()).font(.callout).foregroundStyle(.secondary)
                 .accessibilityIdentifier("veronica.backToFolders")
             Spacer(minLength: 0)
         }

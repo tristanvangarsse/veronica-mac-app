@@ -112,7 +112,7 @@ struct ScanResultsView: View {
                     .background(category == value ? VeronicaTheme.accentFill : .clear, in: RoundedRectangle(cornerRadius: 11))
                     .foregroundStyle(category == value ? VeronicaTheme.accent : VeronicaTheme.ink)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(VeronicaPlainButtonStyle())
                 .accessibilityIdentifier("veronica.filter.\(value)")
             }
             Spacer()
@@ -177,21 +177,33 @@ struct ScanResultsView: View {
         if let item = selection {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
-                    ResultThumbnail(url: item.fileURL)
                     VStack(alignment: .leading, spacing: 6) {
                         Text(item.filename).font(.title3.weight(.semibold)).textSelection(.enabled)
-                        Text(item.fileURL.path).font(.caption).foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
                         Text(ByteCountFormatter.string(fromByteCount: item.sourceSize, countStyle: .file))
                             .font(.callout).foregroundStyle(.secondary)
                     }
                     VStack(alignment: .leading, spacing: 10) {
+                        if item.category == "review" {
+                            Text("Why this file needs review")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        }
                         Label(item.actionTitle, systemImage: item.category == "review" ? "questionmark.circle" : item.category == "changes" ? "sparkles" : "checkmark.shield")
                             .font(.headline).foregroundStyle(VeronicaTheme.accent)
-                        Text(item.detail).font(.callout).lineSpacing(4).textSelection(.enabled)
+                        Text(item.category == "review" ? item.reviewExplanation.explanation : item.detail)
+                            .font(.callout).lineSpacing(4).textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if item.category == "review" {
+                            Text("What you can do").font(.subheadline.weight(.semibold))
+                            Text(item.reviewExplanation.nextStep)
+                                .font(.callout).fixedSize(horizontal: false, vertical: true)
+                            Text("This file has not been changed.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                     .padding(18).frame(maxWidth: .infinity, alignment: .leading)
                     .background(VeronicaTheme.accentFill, in: RoundedRectangle(cornerRadius: 18))
+                    .accessibilityIdentifier("veronica.fileExplanation")
                     VStack(alignment: .leading, spacing: 10) {
                         Label("File date", systemImage: "calendar").font(.headline)
                         Text(item.embeddedDate ?? "No embedded date")
@@ -213,15 +225,23 @@ struct ScanResultsView: View {
                     }
                     .padding(18).frame(maxWidth: .infinity, alignment: .leading)
                     .background(VeronicaTheme.subtleFill, in: RoundedRectangle(cornerRadius: 18))
+                    ResultThumbnail(url: item.fileURL)
+                    Text(item.fileURL.path).font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
                     HStack {
                         Button("Preview") { ReviewQuickLookController.shared.show(item.fileURL) }
                         Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([item.fileURL]) }
                     }
                     if let review = model.snapshot?.unresolvedReviews.first(where: { $0.id == item.id }) {
                         VStack(alignment: .leading, spacing: 10) {
-                            Text(review.explanation).font(.callout).foregroundStyle(.secondary)
                             Button("Review this decision…") { pendingDecision = review }
                                 .disabled(recordingDecision || !model.hasLiveSnapshot)
+                        }
+                    }
+                    if item.category == "review" {
+                        DisclosureGroup("Technical details") {
+                            Text(item.reason).font(.caption.monospaced()).textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
                 }.padding(24)

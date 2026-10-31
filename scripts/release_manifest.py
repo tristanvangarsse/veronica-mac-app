@@ -84,6 +84,37 @@ def libraries(binary):
                 found[str(lib)]=sha(lib);pending.append(lib)
     return found
 
+def bundle_date_editor(tool, vendor):
+    """Copy the Perl program, never Homebrew's environment launcher."""
+    import shutil
+    tool = Path(tool).resolve()
+    prefix = tool.parent.parent
+    library = prefix/'libexec/lib/perl5'
+    # Recent Homebrew bottles expose a shell launcher in bin/ and put the
+    # actual program in libexec/bin/. Older bottles patched the Perl program
+    # directly. Inspect only this known package layout; do not run a wrapper.
+    script = tool.read_text()
+    if not re.match(r'^#!\s*/usr/bin/perl[0-9.]*(?:\s|$)', script):
+        program = prefix/'libexec/bin/exiftool'
+        if program.is_file():
+            script = program.read_text()
+    require(re.match(r'^#!\s*/usr/bin/perl[0-9.]*(?:\s|$)', script),
+            'ExifTool must use the macOS system Perl interpreter')
+    script = re.sub(r'    use Config;\nunshift @INC, .*?;\nunshift @INC, .*?;',
+                    '    unshift @INC, $incDir;', script, count=1)
+    require(not any(path in script for path in ('/opt/homebrew/', '/usr/local/Cellar/', '/usr/local/opt/')),
+            'ExifTool still contains an absolute library path')
+    require('unshift @INC, $incDir;' in script, 'ExifTool does not load its bundled relative library')
+    vendor = Path(vendor)
+    if vendor.exists():
+        shutil.rmtree(vendor)
+    vendor.mkdir(parents=True)
+    shutil.copytree(library/'Image', vendor/'lib/Image')
+    shutil.copytree(library/'File', vendor/'lib/File')
+    (vendor/'exiftool').write_text(script)
+    shutil.copy2(prefix/'README', vendor/'README')
+
+
 def generate(output):
     sys.path.insert(0,str(ROOT))
     import media_security as sec
@@ -95,16 +126,7 @@ def generate(output):
     tool = Path(sec.resolve_tool('exiftool') or '')
     if not tool.is_file(): raise RuntimeError('ExifTool is required to build the date editor')
     vendor = Path(output).parent/'ExifTool'
-    if vendor.exists(): shutil.rmtree(vendor)
-    vendor.mkdir(parents=True)
-    library = tool.parent.parent/'libexec/lib/perl5'
-    shutil.copytree(library/'Image', vendor/'lib/Image')
-    shutil.copytree(library/'File', vendor/'lib/File')
-    script = tool.read_text()
-    script = re.sub(r'    use Config;\nunshift @INC, .*?;\nunshift @INC, .*?;', '    unshift @INC, $incDir;', script, count=1)
-    require('/opt/homebrew/' not in script, 'ExifTool still contains an absolute library path')
-    (vendor/'exiftool').write_text(script)
-    shutil.copy2(tool.parent.parent/'README', vendor/'README')
+    bundle_date_editor(tool, vendor)
     # ExifTool uses the same Artistic/GPL terms as Perl; retain its bundled
     # copyright notices and both standard license texts from the system Perl.
     for name in ('perlartistic.pod', 'perlgpl.pod'):
