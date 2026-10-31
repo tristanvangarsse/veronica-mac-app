@@ -1771,17 +1771,10 @@ def apply_filename_policy(
     if item.get("operation") in {"SKIP_MEDIA_TYPE_DISABLED", "SKIP_EXTENSION_DISABLED"}:
         return item
 
-    if not cfg.get("filename_standardization_enabled", True):
-        return item
-
     if item.get("operation") in {"REVIEW", "PRESERVE", "SKIP_TOO_NEW"}:
         return item
 
     if row.get("detected_kind") not in {"image", "video", "audio"}:
-        return item
-
-    best_date = row.get("best_date")
-    if not best_date:
         return item
 
     target_extension: Optional[str] = None
@@ -1792,6 +1785,21 @@ def apply_filename_policy(
         target_extension = ".mp4"
     elif item.get("operation") == "CONVERT_AUDIO":
         target_extension = ".mp3"
+
+    # Disabling date/name standardization preserves the stem, not a suffix
+    # belonging to the source format. Every published conversion still needs
+    # an extension matching its actual encoded contents.
+    if not cfg.get("filename_standardization_enabled", True):
+        rel = Path(item["relpath"])
+        matching_extensions = {".jpg", ".jpeg"} if target_extension == ".jpg" else {target_extension}
+        if target_extension and rel.suffix.lower() not in matching_extensions:
+            item["target"] = {**item.get("target", {}),
+                              "final_relpath": rel.with_suffix(target_extension).as_posix()}
+        return item
+
+    best_date = row.get("best_date")
+    if not best_date:
+        return item
 
     filename = canonical_media_filename(
         str(item["relpath"]),
@@ -6706,7 +6714,11 @@ def cmd_scan_results(args: argparse.Namespace) -> int:
                 elif category == "unchanged" and item.get("executable"):
                     detail = "This planned action has already been completed or the original was kept. No further change is queued."
                 import media_dates
-                date_supported = Path(item["relpath"]).suffix.lower() in media_dates.SUPPORTED and item["operation"] != "PRESERVE"
+                date_supported = (
+                    Path(item["relpath"]).suffix.lower() in media_dates.SUPPORTED
+                    and item["operation"] != "PRESERVE"
+                    and item["reason"] not in {"empty_file", "media_probe_failed", "video_source_probe_failed"}
+                )
                 items.append({"root": str(folder), "state_dir": str(folder_state),
                               "plan_path": str(plan_path), "embedded_date": dates.get(item["relpath"]) or dates.get((item.get("target") or {}).get("final_relpath")),
                               "can_edit_date": date_supported,
@@ -7722,7 +7734,15 @@ def cmd_desktop_session(args: argparse.Namespace) -> int:
                     # Refuse unknown or modified originals, even when the user
                     # has quit during a partially completed conversion.
                     with security.database(state / "media-maintenance.sqlite") as con:
-                        rows = con.execute("SELECT quarantine_path,source_original_sha256 FROM commit_items WHERE status='COMMITTED'").fetchall()
+                        # Recovery can leave an exact backup alongside a restored
+                        # source (for example, a write refused by a read-only
+                        # library). It is still a known original, not an unknown
+                        # file. Return it for the same verified native Trash path.
+                        rows = con.execute(
+                            "SELECT quarantine_path,source_original_sha256 FROM commit_items "
+                            "WHERE status IN ('COMMITTED','ROLLED_BACK','RECOVERED_ROLLED_BACK') "
+                            "AND quarantine_path IS NOT NULL AND source_original_sha256 IS NOT NULL"
+                        ).fetchall()
                     known = {}
                     for path, digest in rows:
                         relative_path = Path(path).relative_to(state / "quarantine")

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.16.0 beta 3
+
+- Shows the specific reason a file needs review before its preview, with a matching title in the file list and clear next steps. Combined safety risks are all explained; technical codes remain available in a disclosure.
+- Describes missing dates, unreadable or empty files, filename conflicts, unsupported formats, HDR, frame timing, camera metadata and extra tracks without guessing what failed.
+- Keeps converted filename extensions consistent with the output format even when date/name standardization is disabled.
+- Releases verified backup copies after a recovered failed write through the normal originals-to-Trash workflow. Changed or unrecognized recovery files still block session disposal.
+- Adds a direct feedback link in Settings → Support and structured GitHub forms for bug reports and beta feedback.
+- Retains independent folder settings, local processing, recoverable originals, and the existing unsigned beta installation route.
+
 ## 0.13.2 - Native diagnostics workflow
 
 - Adds persistent local logging under `~/Library/Application Support/Veronica/logs/veronica.log` with bounded log rotation.

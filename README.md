@@ -21,6 +21,8 @@ Apple Silicon · macOS 26 or later · [Installation and first opening](docs/INST
 
 The beta includes its own tools and prepares them automatically on first launch. It is not Apple-notarized; read the installation guide before opening. Start with copies of test media while evaluating the beta.
 
+**Testing the beta?** Follow the [short tester guide](docs/BETA_TESTING.md). Use **Settings → Support → Report a problem or share beta feedback**, [GitHub feedback forms](https://github.com/tristanvangarsse/veronica-mac-app/issues/new/choose), or reply to the Reddit beta thread. Nothing is uploaded automatically.
+
 ## What is Veronica?
 
 Veronica is a macOS utility for maintaining media libraries without blindly rewriting them.
@@ -76,6 +78,8 @@ Folder names never choose a processing policy. Transparent PNGs, GIFs and protec
 ## In the app
 
 Start with the compact folder screen. Add folders and choose settings for each one, then scan. The summary offers Review results and Smart cleanup. Review expands the window and shows each proposed change. App-wide settings are under **Veronica → Settings** in the menu bar.
+
+Files needing review show the reason before the preview and explain what to do next. If several checks apply, every reason is shown. Expand Technical details to see the diagnostic code. A review status does not mean a file is damaged: it can also mean a missing date, protected video tracks, or a filename conflict.
 
 Dated change logs remain in Application Support and are available through Settings → Support. Temporary scan records are cleared on quit.
 

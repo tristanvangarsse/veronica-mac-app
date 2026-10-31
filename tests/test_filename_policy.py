@@ -91,6 +91,25 @@ assert name.endswith(".jpg")
 # Plan-item policy
 # ----------------------------------------------------------------------
 
+# Turning off date/name standardization must still give converted content its
+# real format extension. JPEG aliases stay unchanged, and disabled types never
+# become executable solely to fix a suffix.
+for relpath, operation, kind, target, expected in [
+    ("Unchanged Stem.png", "CONVERT_IMAGE", "image", {"format": "jpeg"}, "Unchanged Stem.jpg"),
+    ("photo.jpg", "CONVERT_IMAGE", "image", {"format": "png"}, "photo.png"),
+    ("movie.mov", "CONVERT_VIDEO", "video", {}, "movie.mp4"),
+    ("sound.wav", "CONVERT_AUDIO", "audio", {}, "sound.mp3"),
+    ("photo.jpeg", "CONVERT_IMAGE", "image", {"format": "jpeg"}, None),
+    ("leave.png", "SKIP_EXTENSION_DISABLED", "image", {}, None),
+]:
+    converted = mm.apply_filename_policy(
+        {"relpath": relpath, "operation": operation, "target": target},
+        {"relpath": relpath, "detected_kind": kind, "best_date": "2023-01-01"},
+        cfg(filename_standardization_enabled=False),
+    )
+    assert converted["operation"] == operation
+    assert converted["target"].get("final_relpath") == expected, converted
+
 row = {
     "relpath": "Streams/Image/2023/Screenshot 3.png",
     "best_date": "2023-01-01",

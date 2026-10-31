@@ -1,0 +1,24 @@
+name: Beta feedback
+description: Tell us what worked, what was confusing, or what you need next.
+title: "[Feedback] "
+body:
+  - type: markdown
+    attributes:
+      value: "This feedback is public. Please omit private media, filenames and full paths. No report or media is uploaded automatically by the app."
+  - type: input
+    id: version
+    attributes:
+      label: Veronica version/build and macOS version
+    validations:
+      required: true
+  - type: textarea
+    id: experience
+    attributes:
+      label: What did you try, and how did it go?
+    validations:
+      required: true
+  - type: textarea
+    id: improvement
+    attributes:
+      label: What would make Veronica easier to trust or use?
+      description: Specific examples of confusing explanations or steps are especially useful.
