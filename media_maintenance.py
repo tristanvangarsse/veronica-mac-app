@@ -980,7 +980,7 @@ def dependency_status() -> dict[str, Any]:
     try:
         import media_dates
         command=media_dates.exiftool_command()
-        tools['ExifTool']={'available':True,'path':command[1]}
+        tools['ExifTool']={'available':True,'path':str(media_dates.exiftool_program(command))}
         tools['Perl']={'available':True,'path':command[0]}
     except (ValueError,RuntimeError,OSError):
         tools['ExifTool']={'available':False,'path':None}

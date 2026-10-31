@@ -14,6 +14,7 @@ SUPPORTED = IMAGE_EXTENSIONS | QUICKTIME_EXTENSIONS | AUDIO_EXTENSIONS
 
 
 def exiftool_command():
+    interpreter_options = []
     if getattr(sys, 'frozen', False):
         base = Path(sys._MEIPASS)
         manifest = json.loads((base / 'security-manifest.json').read_text())
@@ -29,17 +30,36 @@ def exiftool_command():
         tool = security.resolve_tool('exiftool')
         if not tool:
             raise RuntimeError('The date editor is unavailable. Install ExifTool or rebuild Veronica.')
+        tool = Path(tool)
+        prefix = tool.parent.parent
+        # Homebrew may expose a shell launcher. Run its known Perl program
+        # directly; the restricted worker must never need a shell or PERL5LIB.
+        program = tool
+        if not re.match(r'^#!\s*/usr/bin/perl[0-9.]*(?:\s|$)', program.read_text()):
+            program = prefix / 'libexec/bin/exiftool'
+        if (not program.is_file() or not program.resolve().is_relative_to(prefix.resolve())
+                or not re.match(r'^#!\s*/usr/bin/perl[0-9.]*(?:\s|$)', program.read_text())):
+            raise RuntimeError('The date editor must provide a supported system Perl program.')
+        library = prefix / 'libexec/lib/perl5'
+        if library.is_dir():
+            interpreter_options.append('-I' + str(library))
+        tool = program
     # Use the system interpreter explicitly: no shell, config or user Perl paths.
     perl = Path('/usr/bin/perl5.34')
     if not perl.is_file():
         raise RuntimeError('The system date editor runtime is unavailable.')
-    return [str(perl), str(tool), '-config', '']
+    return [str(perl), *interpreter_options, str(tool), '-config', '']
+
+
+def exiftool_program(command):
+    """Locate the program after any attached interpreter options such as -I."""
+    return Path(next(argument for argument in command[1:] if not argument.startswith('-')))
 
 
 def exiftool(path, arguments, *, write=False):
     command = exiftool_command()
     result = security.bounded_run([*command, *arguments, str(path)], timeout=180,
-        reads=[Path(command[1]), path],
+        reads=[exiftool_program(command), path],
         writes=[path, path.with_name(path.name + '_exiftool_tmp')] if write else [])
     if result.returncode or (write and '1 image files updated' not in result.stdout):
         raise RuntimeError('The date could not be saved safely: ' + (result.stderr or result.stdout)[-1000:])
