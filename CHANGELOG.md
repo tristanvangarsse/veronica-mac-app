@@ -7,6 +7,7 @@
 - Keeps converted filename extensions consistent with the output format even when date/name standardization is disabled.
 - Releases verified backup copies after a recovered failed write through the normal originals-to-Trash workflow. Changed or unrecognized recovery files still block session disposal.
 - Adds a direct feedback link in Settings → Support and structured GitHub forms for bug reports and beta feedback.
+- Builds support both current and older Homebrew ExifTool launcher layouts while retaining strict checks against external runtime paths.
 - Retains independent folder settings, local processing, recoverable originals, and the existing unsigned beta installation route.
 
 ## 0.13.2 - Native diagnostics workflow
