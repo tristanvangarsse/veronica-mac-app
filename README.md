@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/veronica-icon.jpg" width="120" alt="Veronica"/>
+<img src="docs/assets/veronica-promotional-picture.jpg" width="500" alt="Veronica promo picture"/>
 
 # Veronica
 
@@ -13,7 +13,6 @@ Veronica scans the folders you choose, plans maintenance before changing anythin
 **Local-first · Native macOS · Safety-focused · Open source**
 
 </div>
-
 ---
 
 **[Download Veronica for Mac — beta releases](https://github.com/tristanvangarsse/veronica-mac-app/releases)**
@@ -162,3 +161,7 @@ These logs survive quitting, restarting and deleting temporary session data. The
 Veronica includes Python, Pillow, FFmpeg/ffprobe, HandBrakeCLI, ExifTool and their required non-system libraries. First launch prepares and checks the built-in tools automatically, offline, without administrator access or a separate Homebrew installation. Later launches reuse the completed setup while checking component integrity. If the app bundle is incomplete or a component has changed, Veronica asks for the complete app to be reinstalled and leaves media untouched.
 
 Builds relocate and sign the media tools and their entire native library closure, preserving supplied licenses and source provenance in the bundled `MediaTools` folder. The clean-install regression tests operation with network, Homebrew, local tool locations and source checkout access denied.
+
+<div align="center">
+<img src="docs/assets/veronica-icon.jpg" width="200" alt="Veronica icon"/>
+</div>
